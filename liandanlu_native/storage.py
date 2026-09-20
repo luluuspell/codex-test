@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from .models import (
-    Entity, Event, Operation, OperationState, RiskClass, Task, TaskPhase,
-    TaskState, WorldRevisions, new_id, now,
+    Entity, Event, Operation, OperationState, RiskClass, Task, TaskBudget,
+    TaskLease, TaskPhase, TaskState, WorldRevisions, new_id, now,
 )
 
 
@@ -47,6 +47,8 @@ class SQLiteStore:
                 priority INTEGER NOT NULL,
                 lane TEXT NOT NULL,
                 queued_at REAL,
+                wait_reason TEXT,
+                budget_json TEXT NOT NULL DEFAULT '{}',
                 revision INTEGER NOT NULL
             );
 
@@ -94,6 +96,19 @@ class SQLiteStore:
                 browser INTEGER NOT NULL,
                 media INTEGER NOT NULL,
                 tasks INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS workspace_revisions(
+                workspace_id TEXT PRIMARY KEY,
+                revision INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS task_leases(
+                task_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                claimed_at REAL NOT NULL,
+                lease_until REAL NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS event_outbox(
@@ -164,6 +179,8 @@ class SQLiteStore:
         )
         self._ensure_column("tasks", "workspace_id", "TEXT NOT NULL DEFAULT 'default'")
         self._ensure_column("tasks", "queued_at", "REAL")
+        self._ensure_column("tasks", "wait_reason", "TEXT")
+        self._ensure_column("tasks", "budget_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column("operations", "workspace_id", "TEXT NOT NULL DEFAULT 'default'")
         self._ensure_column("operations", "required_permission", "TEXT NOT NULL DEFAULT 'read'")
         self._ensure_column("operations", "idempotency_mode", "TEXT NOT NULL DEFAULT 'RECONCILABLE'")
@@ -180,6 +197,14 @@ class SQLiteStore:
         ):
             self._ensure_column("event_outbox", name, ddl)
         self._migrate_memory_schema()
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO workspace_revisions(workspace_id, revision)
+            SELECT DISTINCT workspace_id,
+                   COALESCE((SELECT workspace FROM world_revisions WHERE singleton=1), 0)
+            FROM world_entities
+            """
+        )
         self.conn.commit()
 
     def _migrate_memory_schema(self) -> None:
@@ -269,8 +294,9 @@ class SQLiteStore:
         self.conn.execute(
             """
             INSERT INTO tasks(task_id, workspace_id, goal, success_criteria_json, constraints_json, state,
-                              desired_state, phase, priority, lane, queued_at, revision)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                              desired_state, phase, priority, lane, queued_at, wait_reason,
+                              budget_json, revision)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(task_id) DO UPDATE SET
                 workspace_id=excluded.workspace_id,
                 goal=excluded.goal,
@@ -282,19 +308,28 @@ class SQLiteStore:
                 priority=excluded.priority,
                 lane=excluded.lane,
                 queued_at=excluded.queued_at,
+                wait_reason=excluded.wait_reason,
+                budget_json=excluded.budget_json,
                 revision=excluded.revision
             """,
             (
                 task.task_id, task.workspace_id, task.goal, json.dumps(task.success_criteria),
                 json.dumps(task.constraints), task.state.value,
                 task.desired_state.value, task.phase.value, task.priority,
-                task.lane, task.queued_at, task.revision,
+                task.lane, task.queued_at, task.wait_reason,
+                json.dumps({
+                    "max_operations": task.budget.max_operations,
+                    "operations_started": task.budget.operations_started,
+                    "deadline_at": task.budget.deadline_at,
+                }),
+                task.revision,
             ),
         )
 
     def load_tasks(self) -> dict[str, Task]:
         result: dict[str, Task] = {}
         for row in self.conn.execute("SELECT * FROM tasks"):
+            budget_data = json.loads(row["budget_json"] or "{}")
             task = Task(
                 task_id=row["task_id"], workspace_id=row["workspace_id"],
                 goal=row["goal"],
@@ -303,7 +338,14 @@ class SQLiteStore:
                 state=TaskState(row["state"]),
                 desired_state=TaskState(row["desired_state"]),
                 phase=TaskPhase(row["phase"]), priority=row["priority"],
-                lane=row["lane"], queued_at=row["queued_at"], revision=row["revision"],
+                lane=row["lane"], queued_at=row["queued_at"],
+                wait_reason=row["wait_reason"],
+                budget=TaskBudget(
+                    max_operations=int(budget_data.get("max_operations", 64)),
+                    operations_started=int(budget_data.get("operations_started", 0)),
+                    deadline_at=budget_data.get("deadline_at"),
+                ),
+                revision=row["revision"],
             )
             result[task.task_id] = task
         return result
@@ -318,6 +360,19 @@ class SQLiteStore:
             return self._insert_outbox(
                 task_id=op.task_id, operation_id=op.operation_id,
                 object_refs=op.object_refs, **event_kwargs
+            )
+
+    def save_task_and_operation_with_outbox_event(
+        self, task: Task, op: Operation, **event_kwargs
+    ) -> str:
+        with self.conn:
+            self._upsert_task(task)
+            self._upsert_operation(op)
+            return self._insert_outbox(
+                task_id=task.task_id,
+                operation_id=op.operation_id,
+                object_refs=op.object_refs,
+                **event_kwargs,
             )
 
     def _upsert_operation(self, op: Operation) -> None:
@@ -415,6 +470,16 @@ class SQLiteStore:
                 ),
             )
 
+    def save_workspace_revision(self, workspace_id: str, revision: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO workspace_revisions(workspace_id,revision) VALUES(?,?)
+                ON CONFLICT(workspace_id) DO UPDATE SET revision=excluded.revision
+                """,
+                (workspace_id, revision),
+            )
+
     def save_world_relation(self, source: str, relation: str, target: str) -> None:
         with self.conn:
             self.conn.execute(
@@ -432,7 +497,17 @@ class SQLiteStore:
                 workspace=row["workspace"], browser=row["browser"],
                 media=row["media"], tasks=row["tasks"],
             )
-        world = WorldModel(revisions=revisions, persistence=self)
+        workspace_revisions = {
+            item["workspace_id"]: item["revision"]
+            for item in self.conn.execute(
+                "SELECT workspace_id,revision FROM workspace_revisions"
+            )
+        }
+        world = WorldModel(
+            revisions=revisions,
+            workspace_revisions=workspace_revisions,
+            persistence=self,
+        )
         for item in self.conn.execute("SELECT * FROM world_entities"):
             entity = Entity(
                 entity_id=item["entity_id"], entity_type=item["entity_type"],
@@ -691,6 +766,125 @@ class SQLiteStore:
                 status="committed", result_ref=record.memory_id,
             )
             return record
+
+    def claim_next_task(
+        self,
+        owner_id: str,
+        *,
+        lease_seconds: float,
+        now_ts: float | None = None,
+    ) -> TaskLease | None:
+        if not owner_id:
+            raise ValueError("owner_id is required")
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        ts = now() if now_ts is None else now_ts
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            row = self.conn.execute(
+                """
+                SELECT t.task_id, l.generation
+                FROM tasks AS t
+                LEFT JOIN task_leases AS l ON l.task_id=t.task_id
+                WHERE t.state=?
+                  AND t.desired_state=?
+                  AND t.queued_at IS NOT NULL
+                  AND (l.task_id IS NULL OR l.lease_until<=?)
+                ORDER BY
+                  CASE WHEN t.lane='interactive' THEN 0 ELSE 1 END,
+                  t.priority DESC,
+                  t.queued_at ASC,
+                  t.task_id ASC
+                LIMIT 1
+                """,
+                (TaskState.QUEUED.value, TaskState.RUNNING.value, ts),
+            ).fetchone()
+            if row is None:
+                self.conn.commit()
+                return None
+            generation = 1 if row["generation"] is None else int(row["generation"]) + 1
+            lease = TaskLease(
+                task_id=row["task_id"],
+                owner_id=owner_id,
+                generation=generation,
+                claimed_at=ts,
+                lease_until=ts + lease_seconds,
+            )
+            self.conn.execute(
+                """
+                INSERT INTO task_leases(
+                    task_id,owner_id,generation,claimed_at,lease_until
+                ) VALUES(?,?,?,?,?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    owner_id=excluded.owner_id,
+                    generation=excluded.generation,
+                    claimed_at=excluded.claimed_at,
+                    lease_until=excluded.lease_until
+                """,
+                (
+                    lease.task_id, lease.owner_id, lease.generation,
+                    lease.claimed_at, lease.lease_until,
+                ),
+            )
+            self.conn.commit()
+            return lease
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def renew_task_lease(
+        self,
+        lease: TaskLease,
+        *,
+        lease_seconds: float,
+        now_ts: float | None = None,
+    ) -> TaskLease | None:
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        ts = now() if now_ts is None else now_ts
+        renewed = TaskLease(
+            task_id=lease.task_id,
+            owner_id=lease.owner_id,
+            generation=lease.generation,
+            claimed_at=lease.claimed_at,
+            lease_until=ts + lease_seconds,
+        )
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                UPDATE task_leases
+                SET lease_until=?
+                WHERE task_id=? AND owner_id=? AND generation=? AND lease_until>?
+                """,
+                (
+                    renewed.lease_until, lease.task_id, lease.owner_id,
+                    lease.generation, ts,
+                ),
+            )
+        return renewed if cursor.rowcount == 1 else None
+
+    def release_task_lease(self, lease: TaskLease) -> bool:
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                DELETE FROM task_leases
+                WHERE task_id=? AND owner_id=? AND generation=?
+                """,
+                (lease.task_id, lease.owner_id, lease.generation),
+            )
+        return cursor.rowcount == 1
+
+    def get_task_lease(self, task_id: str) -> TaskLease | None:
+        row = self.conn.execute(
+            "SELECT * FROM task_leases WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return TaskLease(
+            task_id=row["task_id"], owner_id=row["owner_id"],
+            generation=row["generation"], claimed_at=row["claimed_at"],
+            lease_until=row["lease_until"],
+        )
 
     def pending_outbox(self) -> list[dict[str, Any]]:
         return [

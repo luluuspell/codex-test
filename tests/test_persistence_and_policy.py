@@ -90,7 +90,7 @@ def test_restart_hydrates_world_task_operation_and_reconciles_unknown():
         proposal = ActionProposal("p", "files", "read", ("file_A",))
         op = ops.prepare(
             task, proposal,
-            expected_revisions={"workspace": world.revisions.workspace},
+            expected_revisions={"workspace": world.workspace_revision("ws")},
         )
         ops.execute(op)
         assert op.state is OperationState.UNKNOWN
@@ -142,7 +142,7 @@ def test_policy_uses_authoritative_action_risk_before_operation_creation():
         read_task.desired_state = TaskState.RUNNING
         NativeAgentRunner(
             tasks, ops, Model("read"), policy
-        ).step(read_task, build_manifest(read_task, world.revisions, refs))
+        ).step(read_task, build_manifest(read_task, world, refs))
         assert len(ops.operations) == 1
 
         write_task = tasks.create("write", ("done",), workspace_id="ws")
@@ -150,7 +150,7 @@ def test_policy_uses_authoritative_action_risk_before_operation_creation():
         before = len(ops.operations)
         NativeAgentRunner(
             tasks, ops, Model("write", {"content": "x"}), policy
-        ).step(write_task, build_manifest(write_task, world.revisions, refs))
+        ).step(write_task, build_manifest(write_task, world, refs))
         assert write_task.state is TaskState.WAITING
         assert len(ops.operations) == before
         store.close()
@@ -192,7 +192,7 @@ def test_workspace_scope_blocks_cross_workspace_object_ref():
         with pytest.raises(PermissionError):
             ops.prepare(
                 task, proposal,
-                expected_revisions={"workspace": world.revisions.workspace},
+                expected_revisions={"workspace": world.workspace_revision("ws")},
             )
         assert ops.operations == {}
         store.close()
@@ -222,7 +222,7 @@ def test_prepared_operation_is_abandoned_on_restart_without_reconcile():
         proposal = ActionProposal("p", "files", "read", ("file_A",))
         op = ops.prepare(
             task, proposal,
-            expected_revisions={"workspace": world.revisions.workspace},
+            expected_revisions={"workspace": world.workspace_revision("ws")},
         )
         assert op.state is OperationState.PREPARED
         store.close()
