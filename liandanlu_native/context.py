@@ -39,6 +39,7 @@ class ReferentStack:
 class ContextManifest:
     manifest_id: str
     task_id: str
+    workspace_id: str
     world_revisions: dict[str, int]
     focus_object_refs: tuple[str, ...]
     referent_refs: tuple[str, ...]
@@ -56,6 +57,7 @@ class ContextManifest:
 def build_manifest(task: Task, revisions: WorldRevisions, referents: ReferentStack, *, focus: Iterable[str] = (), fact_refs: Iterable[str] = (), episode_refs: Iterable[str] = (), strategy_refs: Iterable[str] = (), event_range: tuple[int | None, int | None] = (None, None), brain_snapshot_ref: str | None = None, excluded: Iterable[tuple[str, str]] = ()) -> ContextManifest:
     return ContextManifest(
         manifest_id=new_id("ctx"), task_id=task.task_id,
+        workspace_id=task.workspace_id,
         world_revisions={"global_revision": revisions.global_revision, "desktop": revisions.desktop, "workspace": revisions.workspace, "browser": revisions.browser, "media": revisions.media, "tasks": revisions.tasks},
         focus_object_refs=tuple(focus),
         referent_refs=tuple(x.object_ref for x in referents.items[:8]),

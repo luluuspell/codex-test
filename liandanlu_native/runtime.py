@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import heapq
 from typing import Protocol, Any
 
+from .capabilities import CapabilityRegistry
 from .events import EventStore
-from .models import ActionProposal, Operation, OperationState, RiskClass, Task, TaskPhase, TaskState, new_id
+from .models import (
+    ActionProposal, GoalClaim, Operation, OperationState, Task, TaskPhase,
+    TaskState, new_id,
+)
 from .world import WorldModel
 
 
@@ -16,25 +21,29 @@ class Capability(Protocol):
 
 class RuntimePersistence(Protocol):
     def save_task(self, task: Task) -> None: ...
+    def save_task_with_outbox_event(self, task: Task, **event_kwargs) -> str: ...
     def save_operation(self, op: Operation) -> None: ...
-    def save_operation_with_outbox(self, op: Operation, *, event_type: str, payload: dict[str, Any] | None = None) -> None: ...
+    def save_operation_with_outbox_event(self, op: Operation, **event_kwargs) -> str: ...
 
 
 @dataclass
 class TaskScheduler:
-    interactive: list[str] = field(default_factory=list)
-    background: list[str] = field(default_factory=list)
+    interactive: list[tuple[int, int, str]] = field(default_factory=list)
+    background: list[tuple[int, int, str]] = field(default_factory=list)
+    _sequence: int = 0
 
     def submit(self, task: Task) -> None:
         task.state = TaskState.QUEUED
         task.desired_state = TaskState.RUNNING
-        (self.interactive if task.lane == "interactive" else self.background).append(task.task_id)
+        self._sequence += 1
+        item = (-task.priority, self._sequence, task.task_id)
+        heapq.heappush(self.interactive if task.lane == "interactive" else self.background, item)
 
     def next_task(self) -> str | None:
         if self.interactive:
-            return self.interactive.pop(0)
+            return heapq.heappop(self.interactive)[2]
         if self.background:
-            return self.background.pop(0)
+            return heapq.heappop(self.background)[2]
         return None
 
 
@@ -42,96 +51,135 @@ class TaskScheduler:
 class OperationRuntime:
     world: WorldModel
     events: EventStore
+    registry: CapabilityRegistry
     capabilities: dict[str, Capability] = field(default_factory=dict)
     operations: dict[str, Operation] = field(default_factory=dict)
     persistence: RuntimePersistence | None = None
 
-    def _persist(self, op: Operation, event_type: str, payload: dict[str, Any] | None = None) -> None:
-        if self.persistence:
-            self.persistence.save_operation_with_outbox(op, event_type=event_type, payload=payload)
+    def __post_init__(self) -> None:
+        if self.persistence is not None:
+            if self.events.persistence is not self.persistence:
+                raise ValueError("EventStore and OperationRuntime must share one persistence authority")
+            if self.world.persistence is not self.persistence:
+                raise ValueError("WorldModel and OperationRuntime must share one persistence authority")
 
-    def prepare(self, task: Task, proposal: ActionProposal, *, risk: RiskClass, expected_revisions: dict[str, int]) -> Operation:
+    def _save(self, op: Operation) -> None:
+        if self.persistence:
+            self.persistence.save_operation(op)
+
+    def _record(self, op: Operation, event_type: str, actor: str, payload: dict[str, Any] | None = None) -> None:
+        if self.persistence:
+            self.persistence.save_operation_with_outbox_event(
+                op, event_type=event_type, actor=actor, payload=payload or {}
+            )
+        else:
+            self.events.enqueue_outbox(
+                event_type=event_type, actor=actor, task_id=op.task_id,
+                operation_id=op.operation_id, object_refs=op.object_refs,
+                payload=payload or {},
+            )
+
+    def prepare(self, task: Task, proposal: ActionProposal, *, expected_revisions: dict[str, int]) -> Operation:
+        spec = self.registry.resolve(proposal)
         self.world.assert_revisions(expected_revisions)
+        for ref in proposal.object_refs:
+            self.world.assert_access(
+                ref, spec.required_permission, workspace_id=task.workspace_id
+            )
         op = Operation(
-            operation_id=new_id("op"),
-            task_id=task.task_id,
-            capability=proposal.capability,
-            action=proposal.action,
-            object_refs=proposal.object_refs,
-            arguments=proposal.arguments,
-            risk_class=risk,
+            operation_id=new_id("op"), task_id=task.task_id,
+            workspace_id=task.workspace_id,
+            capability=proposal.capability, action=proposal.action,
+            object_refs=proposal.object_refs, arguments=proposal.arguments,
+            risk_class=spec.risk_class,
+            required_permission=spec.required_permission,
+            idempotency_mode=spec.idempotency_mode.value,
             state=OperationState.PREPARED,
             expected_revisions=dict(expected_revisions),
         )
         self.operations[op.operation_id] = op
-        self._persist(op, "operation.prepared")
-        self.events.enqueue_outbox(
-            event_type="operation.prepared", actor="engine", task_id=task.task_id,
-            operation_id=op.operation_id, object_refs=op.object_refs,
-        )
+        self._record(op, "operation.prepared", "engine")
         return op
 
-    def execute(self, op: Operation, *, permission: str = "read") -> Operation:
+    def _verify(self, op: Operation, capability: Capability) -> Operation:
+        if op.result is None:
+            op.state = OperationState.UNKNOWN
+            self._record(op, "operation.verify_missing_result", "verifier")
+            return op
+        op.state = OperationState.VERIFYING
+        self._save(op)
+        try:
+            evidence = capability.verify(op, op.result)
+        except Exception as exc:
+            op.error = repr(exc)
+            self._record(op, "operation.verify_error", "verifier", {"error": op.error})
+            return op
+        op.evidence.extend(evidence)
+        if evidence and all(item.get("status") == "pass" for item in evidence):
+            op.state = OperationState.VERIFIED
+            event_type = "operation.verified"
+        else:
+            op.state = OperationState.FAILED
+            event_type = "operation.verification_failed"
+        self._record(op, event_type, "verifier", {"evidence": evidence})
+        return op
+
+    def execute(self, op: Operation) -> Operation:
         capability = self.capabilities[op.capability]
         self.world.assert_revisions(op.expected_revisions)
-        locators = tuple(self.world.resolve_locator(ref, permission) for ref in op.object_refs)
+        locators = tuple(
+            self.world.resolve_locator(
+                ref, op.required_permission, workspace_id=op.workspace_id
+            )
+            for ref in op.object_refs
+        )
         op.state = OperationState.RUNNING
-        if self.persistence:
-            self.persistence.save_operation(op)
+        self._record(op, "operation.started", "engine")
         try:
             result = capability.execute(op, locators)
         except Exception as exc:
             op.state = OperationState.UNKNOWN
             op.error = repr(exc)
-            payload = {"error": op.error}
-            self._persist(op, "operation.unknown", payload)
-            self.events.enqueue_outbox(
-                event_type="operation.unknown", actor="engine", task_id=op.task_id,
-                operation_id=op.operation_id, object_refs=op.object_refs, payload=payload,
-            )
+            self._record(op, "operation.unknown", "engine", {"error": op.error})
             return op
-
         op.result = result
         op.state = OperationState.OBSERVED
-        if self.persistence:
-            self.persistence.save_operation(op)
+        self._save(op)
+        return self._verify(op, capability)
 
-        op.state = OperationState.VERIFYING
-        evidence = capability.verify(op, result)
-        op.evidence.extend(evidence)
-        if evidence and all(x.get("status") == "pass" for x in evidence):
-            op.state = OperationState.VERIFIED
-            payload = {"evidence": evidence}
-            event_type = "operation.verified"
-        else:
-            op.state = OperationState.FAILED
-            payload = {"evidence": evidence}
-            event_type = "operation.verification_failed"
-
-        self._persist(op, event_type, payload)
-        self.events.enqueue_outbox(
-            event_type=event_type, actor="verifier", task_id=op.task_id,
-            operation_id=op.operation_id, object_refs=op.object_refs, payload=payload,
-        )
-        return op
-
-    def recover_operation(self, op: Operation, *, permission: str = "read") -> Operation:
-        if op.state not in {OperationState.RUNNING, OperationState.UNKNOWN, OperationState.PREPARED}:
+    def recover_operation(self, op: Operation) -> Operation:
+        if op.state is OperationState.PREPARED:
+            op.state = OperationState.CANCELLED
+            self._record(
+                op, "operation.abandoned_prepared", "recovery",
+                {"reason": "no external execution was recorded before restart"},
+            )
+            return op
+        capability = self.capabilities[op.capability]
+        if op.state in {OperationState.OBSERVED, OperationState.VERIFYING} and op.result is not None:
+            return self._verify(op, capability)
+        if op.state not in {
+            OperationState.RUNNING, OperationState.UNKNOWN, OperationState.RECONCILING
+        }:
             return op
         op.state = OperationState.RECONCILING
-        if self.persistence:
-            self.persistence.save_operation(op)
-        capability = self.capabilities[op.capability]
-        locators = tuple(self.world.resolve_locator(ref, permission) for ref in op.object_refs)
-        verified, result = capability.reconcile(op, locators)
+        self._record(op, "operation.reconciling", "recovery")
+        try:
+            locators = tuple(
+                self.world.resolve_locator(
+                    ref, op.required_permission, workspace_id=op.workspace_id
+                )
+                for ref in op.object_refs
+            )
+            verified, result = capability.reconcile(op, locators)
+        except Exception as exc:
+            op.state = OperationState.UNKNOWN
+            op.error = repr(exc)
+            self._record(op, "operation.reconcile_error", "recovery", {"error": op.error})
+            return op
         op.result = result
         op.state = OperationState.VERIFIED if verified else OperationState.FAILED
-        payload = {"verified": verified}
-        self._persist(op, "operation.reconciled", payload)
-        self.events.enqueue_outbox(
-            event_type="operation.reconciled", actor="recovery", task_id=op.task_id,
-            operation_id=op.operation_id, object_refs=op.object_refs, payload=payload,
-        )
+        self._record(op, "operation.reconciled", "recovery", {"verified": verified})
         return op
 
 
@@ -142,53 +190,127 @@ class TaskRuntime:
     tasks: dict[str, Task] = field(default_factory=dict)
     persistence: RuntimePersistence | None = None
 
-    def _save(self, task: Task) -> None:
-        if self.persistence:
-            self.persistence.save_task(task)
+    def __post_init__(self) -> None:
+        if self.persistence is not None:
+            if self.events.persistence is not self.persistence:
+                raise ValueError("EventStore and TaskRuntime must share one persistence authority")
+            if self.world.persistence is not self.persistence:
+                raise ValueError("WorldModel and TaskRuntime must share one persistence authority")
 
-    def create(self, goal: str, success_criteria: tuple[str, ...], *, constraints: tuple[str, ...] = (), lane: str = "background", priority: int = 50) -> Task:
+    def _record(self, task: Task, event_type: str, actor: str, payload: dict[str, Any] | None = None) -> None:
+        if self.persistence:
+            self.persistence.save_task_with_outbox_event(
+                task, event_type=event_type, actor=actor, payload=payload or {}
+            )
+        else:
+            self.events.enqueue_outbox(
+                event_type=event_type, actor=actor, task_id=task.task_id,
+                payload=payload or {},
+            )
+
+    def _touch(self, task: Task) -> None:
+        task.revision += 1
+        self.world.revisions.bump("tasks")
+        if self.world.persistence:
+            self.world.persistence.save_world_revisions(self.world.revisions)
+
+    def create(
+        self,
+        goal: str,
+        success_criteria: tuple[str, ...],
+        *,
+        workspace_id: str = "default",
+        constraints: tuple[str, ...] = (),
+        lane: str = "background",
+        priority: int = 50,
+    ) -> Task:
         task = Task(
-            task_id=new_id("task"), goal=goal, success_criteria=success_criteria,
-            constraints=constraints, lane=lane, priority=priority,
+            task_id=new_id("task"), workspace_id=workspace_id, goal=goal,
+            success_criteria=success_criteria, constraints=constraints,
+            lane=lane, priority=priority,
         )
         self.tasks[task.task_id] = task
-        self._save(task)
-        self.events.enqueue_outbox(
-            event_type="task.created", actor="engine", task_id=task.task_id, payload={"goal": goal}
-        )
+        self.world.revisions.bump("tasks")
+        if self.world.persistence:
+            self.world.persistence.save_world_revisions(self.world.revisions)
+        self._record(task, "task.created", "engine", {"goal": goal, "workspace_id": workspace_id})
+        return task
+
+    def update_runtime_state(self, task_id: str, *, state: TaskState | None = None, phase: TaskPhase | None = None, event_type: str = "task.state_changed", actor: str = "engine") -> Task:
+        task = self.tasks[task_id]
+        changed = False
+        if state is not None and task.state != state:
+            task.state = state
+            changed = True
+        if phase is not None and task.phase != phase:
+            task.phase = phase
+            changed = True
+        if changed:
+            self._touch(task)
+            self._record(
+                task, event_type, actor,
+                {"state": task.state.value, "phase": task.phase.value},
+            )
         return task
 
     def control(self, task_id: str, desired: TaskState) -> Task:
         task = self.tasks[task_id]
+        if task.state in {TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED}:
+            return task
         task.desired_state = desired
-        task.revision += 1
-        if desired == TaskState.PAUSED and task.state not in {TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED}:
-            task.state = TaskState.PAUSED
-        elif desired == TaskState.CANCELLED and task.state not in {TaskState.COMPLETED, TaskState.FAILED}:
-            task.state = TaskState.CANCELLED
-        elif desired == TaskState.RUNNING and task.state in {TaskState.PAUSED, TaskState.WAITING, TaskState.QUEUED, TaskState.CREATED}:
-            task.state = TaskState.RUNNING
-        self.world.revisions.bump("tasks")
-        self._save(task)
-        self.events.enqueue_outbox(
-            event_type="task.controlled", actor="user", task_id=task_id,
-            payload={"desired": desired.value, "actual": task.state.value},
+        if desired == TaskState.PAUSED:
+            if task.state == TaskState.RUNNING:
+                task.state = TaskState.PAUSING
+            elif task.state not in {TaskState.CANCELLING, TaskState.CANCELLED}:
+                task.state = TaskState.PAUSED
+        elif desired == TaskState.CANCELLED:
+            if task.state in {TaskState.RUNNING, TaskState.PAUSING}:
+                task.state = TaskState.CANCELLING
+            else:
+                task.state = TaskState.CANCELLED
+        elif desired == TaskState.RUNNING:
+            if task.state in {
+                TaskState.PAUSED, TaskState.PAUSING, TaskState.WAITING,
+                TaskState.QUEUED, TaskState.CREATED,
+            }:
+                task.state = TaskState.RUNNING
+        self._touch(task)
+        self._record(
+            task, "task.control_requested", "user",
+            {"desired": desired.value, "actual": task.state.value},
         )
         return task
 
-    def evaluate_goal(self, task_id: str, claims: dict[str, bool]) -> Task:
+    def settle_control(self, task_id: str, *, safe_boundary: bool = False, external_cancel_confirmed: bool = False) -> Task:
         task = self.tasks[task_id]
-        missing = [criterion for criterion in task.success_criteria if not claims.get(criterion, False)]
-        if missing:
-            task.state = TaskState.RUNNING
-            task.phase = TaskPhase.REPLANNING
-        else:
-            task.state = TaskState.COMPLETED
-        task.revision += 1
-        self.world.revisions.bump("tasks")
-        self._save(task)
-        self.events.enqueue_outbox(
-            event_type="task.goal_evaluated", actor="verifier", task_id=task_id,
-            payload={"missing": missing, "state": task.state.value},
+        before = task.state
+        if task.desired_state == TaskState.PAUSED and safe_boundary:
+            task.state = TaskState.PAUSED
+        elif (
+            task.desired_state == TaskState.CANCELLED
+            and (safe_boundary or external_cancel_confirmed)
+        ):
+            task.state = TaskState.CANCELLED
+        if task.state != before:
+            self._touch(task)
+            self._record(
+                task, "task.control_settled", "engine",
+                {"desired": task.desired_state.value, "actual": task.state.value},
+            )
+        return task
+
+    def evaluate_goal(self, task_id: str, claims: dict[str, GoalClaim]) -> Task:
+        task = self.tasks[task_id]
+        missing: list[str] = []
+        for criterion in task.success_criteria:
+            claim = claims.get(criterion)
+            if claim is None or not claim.passed or not claim.evidence_refs:
+                missing.append(criterion)
+        task.state = TaskState.RUNNING if missing else TaskState.COMPLETED
+        task.phase = TaskPhase.REPLANNING if missing else task.phase
+        self._touch(task)
+        self._record(
+            task, "task.goal_evaluated", "verifier",
+            {"missing": missing, "state": task.state.value},
         )
         return task

@@ -23,15 +23,30 @@ class ControlResolution:
 
 
 class ControlIntentResolver:
-    def resolve(self, intent: ControlIntent, tasks: TaskRuntime, explicit_task_id: str | None = None) -> ControlResolution:
+    def resolve(
+        self,
+        intent: ControlIntent,
+        tasks: TaskRuntime,
+        explicit_task_id: str | None = None,
+    ) -> ControlResolution:
         if intent is ControlIntent.STOP_SPEAKING:
             return ControlResolution(intent, None)
         if explicit_task_id:
             return ControlResolution(intent, explicit_task_id)
+
         if intent is ControlIntent.RESUME_TASK:
-            candidates = [t.task_id for t in tasks.tasks.values() if t.state in {TaskState.PAUSED, TaskState.WAITING}]
+            candidates = [
+                t.task_id for t in tasks.tasks.values()
+                if t.state in {TaskState.PAUSED, TaskState.PAUSING, TaskState.WAITING}
+            ]
         else:
-            candidates = [t.task_id for t in tasks.tasks.values() if t.state in {TaskState.RUNNING, TaskState.QUEUED, TaskState.WAITING}]
+            candidates = [
+                t.task_id for t in tasks.tasks.values()
+                if t.state in {
+                    TaskState.RUNNING, TaskState.QUEUED, TaskState.WAITING,
+                    TaskState.PAUSING, TaskState.CANCELLING,
+                }
+            ]
         if len(candidates) == 1:
             return ControlResolution(intent, candidates[0])
         if not candidates:

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from .context import ContextManifest
-from .models import ActionProposal, RiskClass, Task, TaskPhase, TaskState
+from .models import ActionProposal, OperationState, Task, TaskPhase, TaskState
 from .policy import PolicyDecision, PolicyEngine
 from .runtime import OperationRuntime, TaskRuntime
 
@@ -18,55 +18,71 @@ class NativeAgentRunner:
     tasks: TaskRuntime
     operations: OperationRuntime
     model: CognitiveModel
-    policy: PolicyEngine | None = None
-    workspace_id: str = "default"
+    policy: PolicyEngine
 
-    def step(
-        self,
-        task: Task,
-        manifest: ContextManifest,
-        *,
-        risk: RiskClass = RiskClass.READ,
-        expected_revisions: dict[str, int] | None = None,
-    ) -> None:
+    def step(self, task: Task, manifest: ContextManifest) -> None:
+        if manifest.workspace_id != task.workspace_id:
+            raise ValueError("ContextManifest workspace does not match Task")
         if task.desired_state in {TaskState.PAUSED, TaskState.CANCELLED}:
-            self.tasks.control(task.task_id, task.desired_state)
+            self.tasks.settle_control(task.task_id, safe_boundary=True)
             return
 
-        task.state = TaskState.RUNNING
-        task.phase = TaskPhase.THINKING
+        self.tasks.update_runtime_state(
+            task.task_id, state=TaskState.RUNNING, phase=TaskPhase.THINKING,
+            event_type="task.agent_step_started",
+        )
         proposal = self.model.next_action(manifest)
+        spec = self.operations.registry.resolve(proposal)
+        expected_revisions = {
+            domain: manifest.world_revisions[domain]
+            for domain in spec.revision_domains
+        }
 
-        task.phase = TaskPhase.AUTHORIZING
-        if self.policy is not None:
-            decision = self.policy.evaluate(
-                self.workspace_id, proposal.capability, proposal.action, risk
+        self.tasks.update_runtime_state(
+            task.task_id, phase=TaskPhase.AUTHORIZING,
+            event_type="task.authorizing",
+        )
+        decision = self.policy.evaluate(
+            task.workspace_id, proposal.capability, proposal.action, spec.risk_class
+        )
+        if decision is PolicyDecision.DENY:
+            self.tasks.update_runtime_state(
+                task.task_id, state=TaskState.BLOCKED,
+                event_type="agent.action.blocked", actor="policy",
             )
-            if decision is PolicyDecision.DENY:
-                task.state = TaskState.BLOCKED
-                self.tasks.events.enqueue_outbox(
-                    event_type="agent.action.blocked",
-                    actor="policy",
-                    task_id=task.task_id,
-                    object_refs=proposal.object_refs,
-                    payload={"capability": proposal.capability, "action": proposal.action},
-                )
-                return
-            if decision is PolicyDecision.REQUIRE_CONFIRMATION:
-                task.state = TaskState.WAITING
-                self.tasks.events.enqueue_outbox(
-                    event_type="agent.action.confirmation_required",
-                    actor="policy",
-                    task_id=task.task_id,
-                    object_refs=proposal.object_refs,
-                    payload={"capability": proposal.capability, "action": proposal.action},
-                )
-                return
+            return
+        if decision is PolicyDecision.REQUIRE_CONFIRMATION:
+            self.tasks.update_runtime_state(
+                task.task_id, state=TaskState.WAITING,
+                event_type="agent.action.confirmation_required", actor="policy",
+            )
+            return
 
         op = self.operations.prepare(
-            task, proposal, risk=risk, expected_revisions=expected_revisions or {}
+            task, proposal, expected_revisions=expected_revisions
         )
-        task.phase = TaskPhase.EXECUTING
-        self.operations.execute(op, permission="read" if risk == RiskClass.READ else "write")
-        task.phase = TaskPhase.VERIFYING
+        self.tasks.update_runtime_state(
+            task.task_id, phase=TaskPhase.EXECUTING,
+            event_type="task.executing",
+        )
+        self.operations.execute(op)
+        if op.state in {
+            OperationState.UNKNOWN, OperationState.VERIFYING,
+            OperationState.RECONCILING,
+        }:
+            self.tasks.update_runtime_state(
+                task.task_id, state=TaskState.WAITING,
+                phase=TaskPhase.VERIFYING, event_type="task.waiting_on_operation",
+            )
+        elif op.state is OperationState.VERIFIED:
+            self.tasks.update_runtime_state(
+                task.task_id, state=TaskState.RUNNING,
+                phase=TaskPhase.OBSERVING, event_type="task.operation_verified",
+            )
+        else:
+            self.tasks.update_runtime_state(
+                task.task_id, state=TaskState.RUNNING,
+                phase=TaskPhase.REPLANNING, event_type="task.replanning",
+            )
+        self.tasks.settle_control(task.task_id, safe_boundary=True)
         self.operations.events.flush_outbox()
