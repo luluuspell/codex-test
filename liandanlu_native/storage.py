@@ -46,6 +46,7 @@ class SQLiteStore:
                 phase TEXT NOT NULL,
                 priority INTEGER NOT NULL,
                 lane TEXT NOT NULL,
+                queued_at REAL,
                 revision INTEGER NOT NULL
             );
 
@@ -131,9 +132,36 @@ class SQLiteStore:
                 consumer_id TEXT PRIMARY KEY,
                 sequence INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS consumer_receipts(
+                consumer_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                result_ref TEXT,
+                PRIMARY KEY(consumer_id, event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_records(
+                memory_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                source_event_ids_json TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                revision INTEGER NOT NULL,
+                supersedes TEXT,
+                strategy_state TEXT,
+                support_count INTEGER NOT NULL,
+                UNIQUE(scope, key, kind, revision)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_latest
+                ON memory_records(scope, key, kind, revision DESC);
             """
         )
         self._ensure_column("tasks", "workspace_id", "TEXT NOT NULL DEFAULT 'default'")
+        self._ensure_column("tasks", "queued_at", "REAL")
         self._ensure_column("operations", "workspace_id", "TEXT NOT NULL DEFAULT 'default'")
         self._ensure_column("operations", "required_permission", "TEXT NOT NULL DEFAULT 'read'")
         self._ensure_column("operations", "idempotency_mode", "TEXT NOT NULL DEFAULT 'RECONCILABLE'")
@@ -188,8 +216,8 @@ class SQLiteStore:
         self.conn.execute(
             """
             INSERT INTO tasks(task_id, workspace_id, goal, success_criteria_json, constraints_json, state,
-                              desired_state, phase, priority, lane, revision)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                              desired_state, phase, priority, lane, queued_at, revision)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(task_id) DO UPDATE SET
                 workspace_id=excluded.workspace_id,
                 goal=excluded.goal,
@@ -200,13 +228,14 @@ class SQLiteStore:
                 phase=excluded.phase,
                 priority=excluded.priority,
                 lane=excluded.lane,
+                queued_at=excluded.queued_at,
                 revision=excluded.revision
             """,
             (
                 task.task_id, task.workspace_id, task.goal, json.dumps(task.success_criteria),
                 json.dumps(task.constraints), task.state.value,
                 task.desired_state.value, task.phase.value, task.priority,
-                task.lane, task.revision,
+                task.lane, task.queued_at, task.revision,
             ),
         )
 
@@ -221,7 +250,7 @@ class SQLiteStore:
                 state=TaskState(row["state"]),
                 desired_state=TaskState(row["desired_state"]),
                 phase=TaskPhase(row["phase"]), priority=row["priority"],
-                lane=row["lane"], revision=row["revision"],
+                lane=row["lane"], queued_at=row["queued_at"], revision=row["revision"],
             )
             result[task.task_id] = task
         return result
@@ -452,6 +481,156 @@ class SQLiteStore:
                 """,
                 (consumer_id, sequence),
             )
+
+
+    def _row_to_memory(self, row: sqlite3.Row):
+        from .memory import MemoryKind, MemoryRecord, StrategyState
+        state = StrategyState(row["strategy_state"]) if row["strategy_state"] else None
+        return MemoryRecord(
+            memory_id=row["memory_id"],
+            kind=MemoryKind(row["kind"]),
+            key=row["key"],
+            value=json.loads(row["value_json"]),
+            scope=row["scope"],
+            source_event_ids=tuple(json.loads(row["source_event_ids_json"])),
+            confidence=row["confidence"],
+            revision=row["revision"],
+            supersedes=row["supersedes"],
+            strategy_state=state,
+            support_count=row["support_count"],
+        )
+
+    def load_memory_records(self) -> list:
+        return [
+            self._row_to_memory(row)
+            for row in self.conn.execute(
+                "SELECT * FROM memory_records ORDER BY scope,key,kind,revision"
+            )
+        ]
+
+    def save_memory_record(self, record) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO memory_records(
+                    memory_id,kind,key,value_json,scope,source_event_ids_json,
+                    confidence,revision,supersedes,strategy_state,support_count
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(memory_id) DO UPDATE SET
+                    value_json=excluded.value_json,
+                    confidence=excluded.confidence,
+                    strategy_state=excluded.strategy_state,
+                    support_count=excluded.support_count
+                """,
+                (
+                    record.memory_id, record.kind.value, record.key,
+                    json.dumps(record.value), record.scope,
+                    json.dumps(record.source_event_ids), record.confidence,
+                    record.revision, record.supersedes,
+                    record.strategy_state.value if record.strategy_state else None,
+                    record.support_count,
+                ),
+            )
+
+    def _advance_consumer_in_transaction(
+        self,
+        consumer_id: str,
+        event_id: str,
+        sequence: int,
+        *,
+        status: str,
+        result_ref: str | None,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO consumer_receipts(
+                consumer_id,event_id,sequence,status,result_ref
+            ) VALUES(?,?,?,?,?)
+            """,
+            (consumer_id, event_id, sequence, status, result_ref),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO consumer_cursors(consumer_id,sequence) VALUES(?,?)
+            ON CONFLICT(consumer_id) DO UPDATE SET
+                sequence=CASE
+                    WHEN excluded.sequence > consumer_cursors.sequence
+                    THEN excluded.sequence ELSE consumer_cursors.sequence
+                END
+            """,
+            (consumer_id, sequence),
+        )
+
+    def process_memory_event(self, event: Event, candidate) -> Any:
+        from .memory import MemoryKind, MemoryRecord, StrategyState
+
+        consumer_id = "memory"
+        with self.conn:
+            receipt = self.conn.execute(
+                """
+                SELECT * FROM consumer_receipts
+                WHERE consumer_id=? AND event_id=?
+                """,
+                (consumer_id, event.event_id),
+            ).fetchone()
+            if receipt is not None:
+                if receipt["result_ref"]:
+                    row = self.conn.execute(
+                        "SELECT * FROM memory_records WHERE memory_id=?",
+                        (receipt["result_ref"],),
+                    ).fetchone()
+                    return self._row_to_memory(row) if row else None
+                return None
+
+            if candidate is None:
+                self._advance_consumer_in_transaction(
+                    consumer_id, event.event_id, event.sequence,
+                    status="ignored", result_ref=None,
+                )
+                return None
+
+            previous = self.conn.execute(
+                """
+                SELECT * FROM memory_records
+                WHERE scope=? AND key=? AND kind=?
+                ORDER BY revision DESC LIMIT 1
+                """,
+                (candidate.scope, candidate.key, candidate.kind.value),
+            ).fetchone()
+            revision = 1 if previous is None else previous["revision"] + 1
+            state = (
+                StrategyState.CANDIDATE
+                if candidate.kind is MemoryKind.STRATEGY else None
+            )
+            record = MemoryRecord(
+                memory_id=new_id("mem"), kind=candidate.kind, key=candidate.key,
+                value=candidate.value, scope=candidate.scope,
+                source_event_ids=candidate.source_event_ids,
+                confidence=candidate.confidence, revision=revision,
+                supersedes=previous["memory_id"] if previous else None,
+                strategy_state=state,
+            )
+            self.conn.execute(
+                """
+                INSERT INTO memory_records(
+                    memory_id,kind,key,value_json,scope,source_event_ids_json,
+                    confidence,revision,supersedes,strategy_state,support_count
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    record.memory_id, record.kind.value, record.key,
+                    json.dumps(record.value), record.scope,
+                    json.dumps(record.source_event_ids), record.confidence,
+                    record.revision, record.supersedes,
+                    record.strategy_state.value if record.strategy_state else None,
+                    record.support_count,
+                ),
+            )
+            self._advance_consumer_in_transaction(
+                consumer_id, event.event_id, event.sequence,
+                status="committed", result_ref=record.memory_id,
+            )
+            return record
 
     def pending_outbox(self) -> list[dict[str, Any]]:
         return [

@@ -8,7 +8,7 @@ from .capabilities import CapabilityRegistry
 from .events import EventStore
 from .models import (
     ActionProposal, GoalClaim, Operation, OperationState, Task, TaskPhase,
-    TaskState, new_id,
+    TaskState, new_id, now,
 )
 from .world import WorldModel
 
@@ -28,23 +28,57 @@ class RuntimePersistence(Protocol):
 
 @dataclass
 class TaskScheduler:
-    interactive: list[tuple[int, int, str]] = field(default_factory=list)
-    background: list[tuple[int, int, str]] = field(default_factory=list)
-    _sequence: int = 0
+    """Durable queue projection.
 
-    def submit(self, task: Task) -> None:
-        task.state = TaskState.QUEUED
-        task.desired_state = TaskState.RUNNING
-        self._sequence += 1
-        item = (-task.priority, self._sequence, task.task_id)
-        heapq.heappush(self.interactive if task.lane == "interactive" else self.background, item)
+    TaskRuntime/SQLite remain authoritative. The heaps are rebuildable indexes,
+    not another source of task truth.
+    """
+    tasks: "TaskRuntime"
+    interactive: list[tuple[int, float, str]] = field(default_factory=list)
+    background: list[tuple[int, float, str]] = field(default_factory=list)
+
+    @classmethod
+    def rebuild(cls, tasks: "TaskRuntime") -> "TaskScheduler":
+        scheduler = cls(tasks)
+        for task in tasks.tasks.values():
+            if (
+                task.state is TaskState.QUEUED
+                and task.desired_state is TaskState.RUNNING
+                and task.queued_at is not None
+            ):
+                scheduler._push(task)
+        return scheduler
+
+    def _push(self, task: Task) -> None:
+        queued_at = task.queued_at if task.queued_at is not None else now()
+        item = (-task.priority, queued_at, task.task_id)
+        heapq.heappush(
+            self.interactive if task.lane == "interactive" else self.background,
+            item,
+        )
+
+    def submit(self, task_id: str) -> Task:
+        task = self.tasks.queue(task_id)
+        self._push(task)
+        return task
+
+    def _pop_valid(self, heap: list[tuple[int, float, str]]) -> str | None:
+        while heap:
+            _, _, task_id = heapq.heappop(heap)
+            task = self.tasks.tasks.get(task_id)
+            if (
+                task is not None
+                and task.state is TaskState.QUEUED
+                and task.desired_state is TaskState.RUNNING
+            ):
+                return task_id
+        return None
 
     def next_task(self) -> str | None:
-        if self.interactive:
-            return heapq.heappop(self.interactive)[2]
-        if self.background:
-            return heapq.heappop(self.background)[2]
-        return None
+        task_id = self._pop_valid(self.interactive)
+        if task_id is not None:
+            return task_id
+        return self._pop_valid(self.background)
 
 
 @dataclass
@@ -234,6 +268,24 @@ class TaskRuntime:
         if self.world.persistence:
             self.world.persistence.save_world_revisions(self.world.revisions)
         self._record(task, "task.created", "engine", {"goal": goal, "workspace_id": workspace_id})
+        return task
+
+    def queue(self, task_id: str) -> Task:
+        task = self.tasks[task_id]
+        if task.state in {TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED}:
+            raise ValueError("terminal task cannot be queued")
+        task.state = TaskState.QUEUED
+        task.desired_state = TaskState.RUNNING
+        task.queued_at = now()
+        self._touch(task)
+        self._record(
+            task, "task.queued", "engine",
+            {
+                "lane": task.lane,
+                "priority": task.priority,
+                "queued_at": task.queued_at,
+            },
+        )
         return task
 
     def update_runtime_state(self, task_id: str, *, state: TaskState | None = None, phase: TaskPhase | None = None, event_type: str = "task.state_changed", actor: str = "engine") -> Task:

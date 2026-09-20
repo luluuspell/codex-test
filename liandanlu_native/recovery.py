@@ -5,14 +5,16 @@ from typing import Mapping
 
 from .capabilities import CapabilityRegistry
 from .events import EventStore
+from .memory import MemoryStore
 from .models import OperationState, TaskState
-from .runtime import Capability, OperationRuntime, TaskRuntime
+from .runtime import Capability, OperationRuntime, TaskRuntime, TaskScheduler
 
 
 @dataclass
 class RecoveryCoordinator:
     tasks: TaskRuntime
     operations: OperationRuntime
+    memory: MemoryStore | None = None
 
     @classmethod
     def from_store(
@@ -34,7 +36,12 @@ class RecoveryCoordinator:
             persistence=store,
         )
         operations.operations = store.load_operations()
-        return cls(tasks=tasks, operations=operations)
+        memory = MemoryStore.from_persistence(store)
+        return cls(tasks=tasks, operations=operations, memory=memory)
+
+
+    def rebuild_scheduler(self) -> TaskScheduler:
+        return TaskScheduler.rebuild(self.tasks)
 
     def recover(self) -> dict[str, int]:
         reconciled = 0
