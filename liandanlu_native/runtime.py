@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Protocol, Any
+from typing import Protocol, Any
 
 from .events import EventStore
 from .models import ActionProposal, Operation, OperationState, RiskClass, Task, TaskPhase, TaskState, new_id
-from .world import WorldModel, StaleWorld
+from .world import WorldModel
 
 
 class Capability(Protocol):
     def execute(self, operation: Operation, locators: tuple[str, ...]) -> dict[str, Any]: ...
     def verify(self, operation: Operation, result: dict[str, Any]) -> list[dict[str, Any]]: ...
     def reconcile(self, operation: Operation, locators: tuple[str, ...]) -> tuple[bool, dict[str, Any]]: ...
+
+
+class RuntimePersistence(Protocol):
+    def save_task(self, task: Task) -> None: ...
+    def save_operation(self, op: Operation) -> None: ...
+    def save_operation_with_outbox(self, op: Operation, *, event_type: str, payload: dict[str, Any] | None = None) -> None: ...
 
 
 @dataclass
@@ -38,12 +44,31 @@ class OperationRuntime:
     events: EventStore
     capabilities: dict[str, Capability] = field(default_factory=dict)
     operations: dict[str, Operation] = field(default_factory=dict)
+    persistence: RuntimePersistence | None = None
+
+    def _persist(self, op: Operation, event_type: str, payload: dict[str, Any] | None = None) -> None:
+        if self.persistence:
+            self.persistence.save_operation_with_outbox(op, event_type=event_type, payload=payload)
 
     def prepare(self, task: Task, proposal: ActionProposal, *, risk: RiskClass, expected_revisions: dict[str, int]) -> Operation:
         self.world.assert_revisions(expected_revisions)
-        op = Operation(operation_id=new_id("op"), task_id=task.task_id, capability=proposal.capability, action=proposal.action, object_refs=proposal.object_refs, arguments=proposal.arguments, risk_class=risk, state=OperationState.PREPARED, expected_revisions=dict(expected_revisions))
+        op = Operation(
+            operation_id=new_id("op"),
+            task_id=task.task_id,
+            capability=proposal.capability,
+            action=proposal.action,
+            object_refs=proposal.object_refs,
+            arguments=proposal.arguments,
+            risk_class=risk,
+            state=OperationState.PREPARED,
+            expected_revisions=dict(expected_revisions),
+        )
         self.operations[op.operation_id] = op
-        self.events.enqueue_outbox(event_type="operation.prepared", actor="engine", task_id=task.task_id, operation_id=op.operation_id, object_refs=op.object_refs)
+        self._persist(op, "operation.prepared")
+        self.events.enqueue_outbox(
+            event_type="operation.prepared", actor="engine", task_id=task.task_id,
+            operation_id=op.operation_id, object_refs=op.object_refs,
+        )
         return op
 
     def execute(self, op: Operation, *, permission: str = "read") -> Operation:
@@ -51,36 +76,62 @@ class OperationRuntime:
         self.world.assert_revisions(op.expected_revisions)
         locators = tuple(self.world.resolve_locator(ref, permission) for ref in op.object_refs)
         op.state = OperationState.RUNNING
+        if self.persistence:
+            self.persistence.save_operation(op)
         try:
             result = capability.execute(op, locators)
         except Exception as exc:
             op.state = OperationState.UNKNOWN
             op.error = repr(exc)
-            self.events.enqueue_outbox(event_type="operation.unknown", actor="engine", task_id=op.task_id, operation_id=op.operation_id, object_refs=op.object_refs, payload={"error": op.error})
+            payload = {"error": op.error}
+            self._persist(op, "operation.unknown", payload)
+            self.events.enqueue_outbox(
+                event_type="operation.unknown", actor="engine", task_id=op.task_id,
+                operation_id=op.operation_id, object_refs=op.object_refs, payload=payload,
+            )
             return op
+
         op.result = result
         op.state = OperationState.OBSERVED
+        if self.persistence:
+            self.persistence.save_operation(op)
+
         op.state = OperationState.VERIFYING
         evidence = capability.verify(op, result)
         op.evidence.extend(evidence)
         if evidence and all(x.get("status") == "pass" for x in evidence):
             op.state = OperationState.VERIFIED
-            self.events.enqueue_outbox(event_type="operation.verified", actor="verifier", task_id=op.task_id, operation_id=op.operation_id, object_refs=op.object_refs, payload={"evidence": evidence})
+            payload = {"evidence": evidence}
+            event_type = "operation.verified"
         else:
             op.state = OperationState.FAILED
-            self.events.enqueue_outbox(event_type="operation.verification_failed", actor="verifier", task_id=op.task_id, operation_id=op.operation_id, object_refs=op.object_refs, payload={"evidence": evidence})
+            payload = {"evidence": evidence}
+            event_type = "operation.verification_failed"
+
+        self._persist(op, event_type, payload)
+        self.events.enqueue_outbox(
+            event_type=event_type, actor="verifier", task_id=op.task_id,
+            operation_id=op.operation_id, object_refs=op.object_refs, payload=payload,
+        )
         return op
 
     def recover_operation(self, op: Operation, *, permission: str = "read") -> Operation:
         if op.state not in {OperationState.RUNNING, OperationState.UNKNOWN, OperationState.PREPARED}:
             return op
         op.state = OperationState.RECONCILING
+        if self.persistence:
+            self.persistence.save_operation(op)
         capability = self.capabilities[op.capability]
         locators = tuple(self.world.resolve_locator(ref, permission) for ref in op.object_refs)
         verified, result = capability.reconcile(op, locators)
         op.result = result
         op.state = OperationState.VERIFIED if verified else OperationState.FAILED
-        self.events.enqueue_outbox(event_type="operation.reconciled", actor="recovery", task_id=op.task_id, operation_id=op.operation_id, object_refs=op.object_refs, payload={"verified": verified})
+        payload = {"verified": verified}
+        self._persist(op, "operation.reconciled", payload)
+        self.events.enqueue_outbox(
+            event_type="operation.reconciled", actor="recovery", task_id=op.task_id,
+            operation_id=op.operation_id, object_refs=op.object_refs, payload=payload,
+        )
         return op
 
 
@@ -89,11 +140,22 @@ class TaskRuntime:
     world: WorldModel
     events: EventStore
     tasks: dict[str, Task] = field(default_factory=dict)
+    persistence: RuntimePersistence | None = None
+
+    def _save(self, task: Task) -> None:
+        if self.persistence:
+            self.persistence.save_task(task)
 
     def create(self, goal: str, success_criteria: tuple[str, ...], *, constraints: tuple[str, ...] = (), lane: str = "background", priority: int = 50) -> Task:
-        task = Task(task_id=new_id("task"), goal=goal, success_criteria=success_criteria, constraints=constraints, lane=lane, priority=priority)
+        task = Task(
+            task_id=new_id("task"), goal=goal, success_criteria=success_criteria,
+            constraints=constraints, lane=lane, priority=priority,
+        )
         self.tasks[task.task_id] = task
-        self.events.enqueue_outbox(event_type="task.created", actor="engine", task_id=task.task_id, payload={"goal": goal})
+        self._save(task)
+        self.events.enqueue_outbox(
+            event_type="task.created", actor="engine", task_id=task.task_id, payload={"goal": goal}
+        )
         return task
 
     def control(self, task_id: str, desired: TaskState) -> Task:
@@ -107,7 +169,11 @@ class TaskRuntime:
         elif desired == TaskState.RUNNING and task.state in {TaskState.PAUSED, TaskState.WAITING, TaskState.QUEUED, TaskState.CREATED}:
             task.state = TaskState.RUNNING
         self.world.revisions.bump("tasks")
-        self.events.enqueue_outbox(event_type="task.controlled", actor="user", task_id=task_id, payload={"desired": desired.value, "actual": task.state.value})
+        self._save(task)
+        self.events.enqueue_outbox(
+            event_type="task.controlled", actor="user", task_id=task_id,
+            payload={"desired": desired.value, "actual": task.state.value},
+        )
         return task
 
     def evaluate_goal(self, task_id: str, claims: dict[str, bool]) -> Task:
@@ -120,5 +186,9 @@ class TaskRuntime:
             task.state = TaskState.COMPLETED
         task.revision += 1
         self.world.revisions.bump("tasks")
-        self.events.enqueue_outbox(event_type="task.goal_evaluated", actor="verifier", task_id=task_id, payload={"missing": missing, "state": task.state.value})
+        self._save(task)
+        self.events.enqueue_outbox(
+            event_type="task.goal_evaluated", actor="verifier", task_id=task_id,
+            payload={"missing": missing, "state": task.state.value},
+        )
         return task
