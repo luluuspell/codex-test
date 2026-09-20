@@ -101,6 +101,7 @@ class Task:
     phase: TaskPhase = TaskPhase.OBSERVING
     priority: int = 50
     lane: str = "background"
+    queued_at: float | None = None
     revision: int = 1
 
 

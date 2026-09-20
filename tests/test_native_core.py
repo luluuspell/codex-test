@@ -148,13 +148,13 @@ def test_goal_completion_requires_evidence_refs():
 
 def test_scheduler_prioritizes_lane_then_priority():
     world, events, tasks, ops = make_core()
-    scheduler = TaskScheduler()
+    scheduler = TaskScheduler(tasks)
     bg = tasks.create("build", ("done",), lane="background", priority=100)
     low = tasks.create("pause music", ("done",), lane="interactive", priority=10)
     high = tasks.create("stop speech", ("done",), lane="interactive", priority=90)
-    scheduler.submit(bg)
-    scheduler.submit(low)
-    scheduler.submit(high)
+    scheduler.submit(bg.task_id)
+    scheduler.submit(low.task_id)
+    scheduler.submit(high.task_id)
     assert scheduler.next_task() == high.task_id
     assert scheduler.next_task() == low.task_id
     assert scheduler.next_task() == bg.task_id

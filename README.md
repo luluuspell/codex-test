@@ -1,37 +1,33 @@
-# Liandanlu Native Companion Core — 0.5.0a3 Runtime Integrity
+# Liandanlu Native Companion Core — 0.5.0a4 Durable Memory & Scheduling
 
-This branch hardens the native Liandanlu Agent runtime around a single-authority model.
+0.5.0a4 builds on the 0.5.0a3 Runtime Integrity baseline and removes two more transient-state gaps: memory consumption and task scheduling.
 
-## Runtime authorities
+## Core guarantees in this slice
 
-- **WorldModel** — current world truth, object identity/relations and domain revisions.
-- **TaskRuntime** — goal lifecycle and truthful desired-vs-actual control state.
-- **OperationRuntime** — every real-world side effect, evidence, verification and reconciliation.
-- **CapabilityRegistry** — authoritative action schema, risk class, permission and idempotency contract.
-- **SQLiteStore** — single-node durable authority for tasks, operations, world identity, event outbox, event log and consumer cursors.
-- **EventStore** — facade over the durable log; it has no competing in-memory outbox when persistence is attached.
-- **MemoryStore** — source-backed fact/episode/strategy reference pipeline.
-- **RuntimeSupervisor** — process generation, health, heartbeat, deadlines and controlled shutdown.
+- **Memory is event-derived and durable.** MemoryPipeline consumes the append-only EventLog using a durable cursor.
+- **Memory consumption is replay-safe.** SQLite stores per-event consumer receipts; committing a memory record and advancing the memory consumer are one transaction.
+- **Memory scope rules survive restart.** Fact/Episode/Strategy records, revisions, supersedes, confidence, strategy state and support count persist.
+- **One event cannot create the same memory twice.** Replayed events return the original memory record instead of creating another revision.
+- **Scheduler queues are projections, not truth.** Task state + queued_at live in the authoritative task store; the in-memory priority heaps can be rebuilt after restart.
+- **Interactive work still outranks background work.** Priority is applied within each lane, while the interactive lane is always checked first.
+- **Recovery restores memory and rebuildable scheduling state** from the same SQLite authority as World/Task/Operation/EventLog.
 
-The cognitive model only emits structured ActionProposal values. It cannot choose its own risk class, pass raw locators through registered action schemas, mark operations verified, or complete a task without evidence-backed goal claims.
+## Existing integrity guarantees retained
 
-## a3 integrity work
-
-- removed the dual-outbox production path;
-- durable append-only events and durable consumer cursors;
-- persistent WorldModel entities, relations and revisions;
-- restart hydration of world/task/operation state followed by reconciliation;
-- PREPARED is no longer treated as evidence that an external side effect ran;
-- actual/desired task control uses PAUSING/CANCELLING intermediate states;
-- ActionSpec makes risk/permission/schema authoritative outside the model;
-- raw path/locator/shell-style argument smuggling is rejected by default;
-- default policy is deny; mutating/external/destructive actions require confirmation unless policy is explicitly changed;
-- goal completion requires evidence references;
-- scheduler activates priority inside interactive/background lanes;
-- supervisor now manages subprocess lifecycle and rejects stale-generation heartbeats.
+- durable single outbox + append-only EventLog + consumer cursors;
+- persistent WorldModel entities, relations and domain revisions;
+- restart hydration and reconcile/verify flow;
+- PREPARED operations are abandoned rather than treated as executed;
+- CapabilityRegistry owns action schema, risk, permission, revision domains and idempotency;
+- nested raw path/locator/shell argument smuggling is rejected;
+- workspace-scoped ObjectRef access;
+- default-deny policy with confirmation for mutation/external/destructive actions;
+- PAUSING/CANCELLING desired-vs-actual task semantics;
+- evidence-backed goal completion;
+- subprocess-aware RuntimeSupervisor.
 
 ## Verification boundary
 
-CI runs clean-checkout tests on Linux Python 3.11/3.13 and macOS Python 3.13, treats warnings as errors, compiles the package, records coverage and enforces a minimum coverage threshold.
+CI compiles and tests clean checkouts on Linux Python 3.11/3.13 and macOS Python 3.13, treats Python warnings as errors, and enforces coverage.
 
-This is still a Native Core development branch, not a claim that real macOS Desktop Bridge actions, realtime voice, WEB/COMMERCE/VIDEO providers or MaleCNS neural computation are product-complete.
+This remains a Native Core development slice. Real Desktop Bridge/macOS Accessibility actions, realtime voice, WEB/COMMERCE/VIDEO providers and MaleCNS neural computation are not claimed complete.
