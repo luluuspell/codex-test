@@ -19,9 +19,10 @@ class NativeAgentRunner:
     operations: OperationRuntime
     model: CognitiveModel
     policy: PolicyEngine
-    workspace_id: str = "default"
 
     def step(self, task: Task, manifest: ContextManifest) -> None:
+        if manifest.workspace_id != task.workspace_id:
+            raise ValueError("ContextManifest workspace does not match Task")
         if task.desired_state in {TaskState.PAUSED, TaskState.CANCELLED}:
             self.tasks.settle_control(task.task_id, safe_boundary=True)
             return
@@ -42,7 +43,7 @@ class NativeAgentRunner:
             event_type="task.authorizing",
         )
         decision = self.policy.evaluate(
-            self.workspace_id, proposal.capability, proposal.action, spec.risk_class
+            task.workspace_id, proposal.capability, proposal.action, spec.risk_class
         )
         if decision is PolicyDecision.DENY:
             self.tasks.update_runtime_state(

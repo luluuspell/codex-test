@@ -73,9 +73,10 @@ def test_context_referent_ambiguity_and_manifest_freezes_revisions():
     world, events, tasks, ops = make_core()
     refs = ReferentStack()
     refs.push("file_A", "selection", 0.95)
-    task = tasks.create("read it", ("read_done",))
+    task = tasks.create("read it", ("read_done",), workspace_id="ws")
     manifest = build_manifest(task, world.revisions, refs, focus=("file_A",))
     assert refs.resolve() == "file_A"
+    assert manifest.workspace_id == "ws"
     assert manifest.world_revisions["workspace"] == world.revisions.workspace
     refs.push("file_B", "recent", 0.90)
     refs.push("file_A", "selection", 0.95)
@@ -84,7 +85,7 @@ def test_context_referent_ambiguity_and_manifest_freezes_revisions():
 
 def test_world_domain_revision_blocks_stale_operation():
     world, events, tasks, ops = make_core()
-    task = tasks.create("read", ("read_done",))
+    task = tasks.create("read", ("read_done",), workspace_id="ws")
     proposal = ActionProposal("p", "files", "read", ("file_A",))
     expected = {"workspace": world.revisions.workspace}
     world.observe("desktop", "selection", {"ref": "file_A"}, "workspace")
@@ -95,7 +96,7 @@ def test_world_domain_revision_blocks_stale_operation():
 def test_agent_uses_object_ref_policy_and_verifier():
     world, events, tasks, ops = make_core()
     ops.capabilities["files"] = ReadCapability()
-    task = tasks.create("read", ("read_done",))
+    task = tasks.create("read", ("read_done",), workspace_id="ws")
     task.desired_state = TaskState.RUNNING
     refs = ReferentStack()
     refs.push("file_A", "selection")
@@ -103,10 +104,11 @@ def test_agent_uses_object_ref_policy_and_verifier():
     policy = PolicyEngine({"ws": WorkspacePolicy(
         allowed_capabilities=frozenset({"files"})
     )})
-    runner = NativeAgentRunner(tasks, ops, Model("file_A"), policy, workspace_id="ws")
+    runner = NativeAgentRunner(tasks, ops, Model("file_A"), policy)
     runner.step(task, manifest)
     op = list(ops.operations.values())[0]
     assert op.state is OperationState.VERIFIED
+    assert op.workspace_id == "ws"
     assert op.result["locator"] == "/workspace/a.txt"
     assert events.all_events()[-1].event_type == "task.operation_verified"
 
@@ -115,7 +117,7 @@ def test_unknown_operation_is_reconciled_after_failure():
     world, events, tasks, ops = make_core()
     failing = ReadCapability(fail=True)
     ops.capabilities["files"] = failing
-    task = tasks.create("read", ("read_done",))
+    task = tasks.create("read", ("read_done",), workspace_id="ws")
     task.desired_state = TaskState.RUNNING
     task.state = TaskState.RUNNING
     proposal = ActionProposal("p", "files", "read", ("file_A",))

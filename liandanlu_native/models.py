@@ -92,6 +92,7 @@ class Entity:
 @dataclass(slots=True)
 class Task:
     task_id: str
+    workspace_id: str
     goal: str
     success_criteria: tuple[str, ...]
     constraints: tuple[str, ...] = ()
@@ -107,6 +108,7 @@ class Task:
 class Operation:
     operation_id: str
     task_id: str
+    workspace_id: str
     capability: str
     action: str
     object_refs: tuple[str, ...]

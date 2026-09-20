@@ -12,12 +12,7 @@ from .models import (
 
 
 class SQLiteStore:
-    """Durable single-node store for Native Core.
-
-    Tasks, operations, world identity, event outbox, event log and consumer
-    cursors live in one SQLite authority so restart recovery does not combine
-    competing in-memory truths.
-    """
+    """Durable single-node store for Native Core."""
 
     def __init__(self, path: str | Path):
         self.path = str(path)
@@ -42,6 +37,7 @@ class SQLiteStore:
             """
             CREATE TABLE IF NOT EXISTS tasks(
                 task_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL DEFAULT 'default',
                 goal TEXT NOT NULL,
                 success_criteria_json TEXT NOT NULL,
                 constraints_json TEXT NOT NULL,
@@ -56,6 +52,7 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS operations(
                 operation_id TEXT PRIMARY KEY,
                 task_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL DEFAULT 'default',
                 capability TEXT NOT NULL,
                 action TEXT NOT NULL,
                 object_refs_json TEXT NOT NULL,
@@ -136,6 +133,8 @@ class SQLiteStore:
             );
             """
         )
+        self._ensure_column("tasks", "workspace_id", "TEXT NOT NULL DEFAULT 'default'")
+        self._ensure_column("operations", "workspace_id", "TEXT NOT NULL DEFAULT 'default'")
         self._ensure_column("operations", "required_permission", "TEXT NOT NULL DEFAULT 'read'")
         self._ensure_column("operations", "idempotency_mode", "TEXT NOT NULL DEFAULT 'RECONCILABLE'")
         for name, ddl in (
@@ -188,10 +187,11 @@ class SQLiteStore:
     def _upsert_task(self, task: Task) -> None:
         self.conn.execute(
             """
-            INSERT INTO tasks(task_id, goal, success_criteria_json, constraints_json, state,
+            INSERT INTO tasks(task_id, workspace_id, goal, success_criteria_json, constraints_json, state,
                               desired_state, phase, priority, lane, revision)
-            VALUES(?,?,?,?,?,?,?,?,?,?)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(task_id) DO UPDATE SET
+                workspace_id=excluded.workspace_id,
                 goal=excluded.goal,
                 success_criteria_json=excluded.success_criteria_json,
                 constraints_json=excluded.constraints_json,
@@ -203,7 +203,7 @@ class SQLiteStore:
                 revision=excluded.revision
             """,
             (
-                task.task_id, task.goal, json.dumps(task.success_criteria),
+                task.task_id, task.workspace_id, task.goal, json.dumps(task.success_criteria),
                 json.dumps(task.constraints), task.state.value,
                 task.desired_state.value, task.phase.value, task.priority,
                 task.lane, task.revision,
@@ -214,7 +214,8 @@ class SQLiteStore:
         result: dict[str, Task] = {}
         for row in self.conn.execute("SELECT * FROM tasks"):
             task = Task(
-                task_id=row["task_id"], goal=row["goal"],
+                task_id=row["task_id"], workspace_id=row["workspace_id"],
+                goal=row["goal"],
                 success_criteria=tuple(json.loads(row["success_criteria_json"])),
                 constraints=tuple(json.loads(row["constraints_json"])),
                 state=TaskState(row["state"]),
@@ -241,11 +242,12 @@ class SQLiteStore:
         self.conn.execute(
             """
             INSERT INTO operations(
-                operation_id,task_id,capability,action,object_refs_json,arguments_json,
+                operation_id,task_id,workspace_id,capability,action,object_refs_json,arguments_json,
                 risk_class,required_permission,idempotency_mode,state,
                 expected_revisions_json,evidence_json,result_json,error
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(operation_id) DO UPDATE SET
+                workspace_id=excluded.workspace_id,
                 state=excluded.state,
                 required_permission=excluded.required_permission,
                 idempotency_mode=excluded.idempotency_mode,
@@ -255,7 +257,7 @@ class SQLiteStore:
                 error=excluded.error
             """,
             (
-                op.operation_id, op.task_id, op.capability, op.action,
+                op.operation_id, op.task_id, op.workspace_id, op.capability, op.action,
                 json.dumps(op.object_refs), json.dumps(op.arguments),
                 op.risk_class.value, op.required_permission, op.idempotency_mode,
                 op.state.value, json.dumps(op.expected_revisions),
@@ -270,6 +272,7 @@ class SQLiteStore:
         for row in self.conn.execute("SELECT * FROM operations"):
             op = Operation(
                 operation_id=row["operation_id"], task_id=row["task_id"],
+                workspace_id=row["workspace_id"],
                 capability=row["capability"], action=row["action"],
                 object_refs=tuple(json.loads(row["object_refs_json"])),
                 arguments=dict(json.loads(row["arguments_json"])),

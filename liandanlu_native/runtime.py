@@ -56,6 +56,13 @@ class OperationRuntime:
     operations: dict[str, Operation] = field(default_factory=dict)
     persistence: RuntimePersistence | None = None
 
+    def __post_init__(self) -> None:
+        if self.persistence is not None:
+            if self.events.persistence is not self.persistence:
+                raise ValueError("EventStore and OperationRuntime must share one persistence authority")
+            if self.world.persistence is not self.persistence:
+                raise ValueError("WorldModel and OperationRuntime must share one persistence authority")
+
     def _save(self, op: Operation) -> None:
         if self.persistence:
             self.persistence.save_operation(op)
@@ -77,6 +84,7 @@ class OperationRuntime:
         self.world.assert_revisions(expected_revisions)
         op = Operation(
             operation_id=new_id("op"), task_id=task.task_id,
+            workspace_id=task.workspace_id,
             capability=proposal.capability, action=proposal.action,
             object_refs=proposal.object_refs, arguments=proposal.arguments,
             risk_class=spec.risk_class,
@@ -100,9 +108,7 @@ class OperationRuntime:
             evidence = capability.verify(op, op.result)
         except Exception as exc:
             op.error = repr(exc)
-            self._record(
-                op, "operation.verify_error", "verifier", {"error": op.error}
-            )
+            self._record(op, "operation.verify_error", "verifier", {"error": op.error})
             return op
         op.evidence.extend(evidence)
         if evidence and all(item.get("status") == "pass" for item in evidence):
@@ -118,7 +124,9 @@ class OperationRuntime:
         capability = self.capabilities[op.capability]
         self.world.assert_revisions(op.expected_revisions)
         locators = tuple(
-            self.world.resolve_locator(ref, op.required_permission)
+            self.world.resolve_locator(
+                ref, op.required_permission, workspace_id=op.workspace_id
+            )
             for ref in op.object_refs
         )
         op.state = OperationState.RUNNING
@@ -128,9 +136,7 @@ class OperationRuntime:
         except Exception as exc:
             op.state = OperationState.UNKNOWN
             op.error = repr(exc)
-            self._record(
-                op, "operation.unknown", "engine", {"error": op.error}
-            )
+            self._record(op, "operation.unknown", "engine", {"error": op.error})
             return op
         op.result = result
         op.state = OperationState.OBSERVED
@@ -149,22 +155,20 @@ class OperationRuntime:
         self._record(op, "operation.reconciling", "recovery")
         try:
             locators = tuple(
-                self.world.resolve_locator(ref, op.required_permission)
+                self.world.resolve_locator(
+                    ref, op.required_permission, workspace_id=op.workspace_id
+                )
                 for ref in op.object_refs
             )
             verified, result = capability.reconcile(op, locators)
         except Exception as exc:
             op.state = OperationState.UNKNOWN
             op.error = repr(exc)
-            self._record(
-                op, "operation.reconcile_error", "recovery", {"error": op.error}
-            )
+            self._record(op, "operation.reconcile_error", "recovery", {"error": op.error})
             return op
         op.result = result
         op.state = OperationState.VERIFIED if verified else OperationState.FAILED
-        self._record(
-            op, "operation.reconciled", "recovery", {"verified": verified}
-        )
+        self._record(op, "operation.reconciled", "recovery", {"verified": verified})
         return op
 
 
@@ -174,6 +178,13 @@ class TaskRuntime:
     events: EventStore
     tasks: dict[str, Task] = field(default_factory=dict)
     persistence: RuntimePersistence | None = None
+
+    def __post_init__(self) -> None:
+        if self.persistence is not None:
+            if self.events.persistence is not self.persistence:
+                raise ValueError("EventStore and TaskRuntime must share one persistence authority")
+            if self.world.persistence is not self.persistence:
+                raise ValueError("WorldModel and TaskRuntime must share one persistence authority")
 
     def _record(self, task: Task, event_type: str, actor: str, payload: dict[str, Any] | None = None) -> None:
         if self.persistence:
@@ -192,9 +203,18 @@ class TaskRuntime:
         if self.world.persistence:
             self.world.persistence.save_world_revisions(self.world.revisions)
 
-    def create(self, goal: str, success_criteria: tuple[str, ...], *, constraints: tuple[str, ...] = (), lane: str = "background", priority: int = 50) -> Task:
+    def create(
+        self,
+        goal: str,
+        success_criteria: tuple[str, ...],
+        *,
+        workspace_id: str = "default",
+        constraints: tuple[str, ...] = (),
+        lane: str = "background",
+        priority: int = 50,
+    ) -> Task:
         task = Task(
-            task_id=new_id("task"), goal=goal,
+            task_id=new_id("task"), workspace_id=workspace_id, goal=goal,
             success_criteria=success_criteria, constraints=constraints,
             lane=lane, priority=priority,
         )
@@ -202,7 +222,7 @@ class TaskRuntime:
         self.world.revisions.bump("tasks")
         if self.world.persistence:
             self.world.persistence.save_world_revisions(self.world.revisions)
-        self._record(task, "task.created", "engine", {"goal": goal})
+        self._record(task, "task.created", "engine", {"goal": goal, "workspace_id": workspace_id})
         return task
 
     def update_runtime_state(self, task_id: str, *, state: TaskState | None = None, phase: TaskPhase | None = None, event_type: str = "task.state_changed", actor: str = "engine") -> Task:

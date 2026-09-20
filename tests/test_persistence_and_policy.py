@@ -36,13 +36,14 @@ class Capability:
 
 
 class Model:
-    def __init__(self, action="read", arguments=None):
+    def __init__(self, action="read", arguments=None, ref="file_A"):
         self.action = action
         self.arguments = arguments or {}
+        self.ref = ref
 
     def next_action(self, manifest):
         return ActionProposal(
-            new_id("proposal"), "files", self.action, ("file_A",), self.arguments
+            new_id("proposal"), "files", self.action, (self.ref,), self.arguments
         )
 
 
@@ -82,7 +83,7 @@ def test_restart_hydrates_world_task_operation_and_reconciles_unknown():
         world, events, store, tasks, ops = build_persistent_core(db)
         failing = Capability(fail=True)
         ops.capabilities["files"] = failing
-        task = tasks.create("read", ("read_done",))
+        task = tasks.create("read", ("read_done",), workspace_id="ws")
         task.desired_state = TaskState.RUNNING
         task.state = TaskState.RUNNING
         store.save_task(task)
@@ -103,6 +104,7 @@ def test_restart_hydrates_world_task_operation_and_reconciles_unknown():
         assert coordinator.operations.world.get("file_A").locator == "/workspace/a.txt"
         result = coordinator.recover()
         loaded = coordinator.operations.operations[op.operation_id]
+        assert loaded.workspace_id == "ws"
         assert result["operations_reconciled"] == 1
         assert loaded.state is OperationState.VERIFIED
         durable_events = coordinator.operations.events.read_after("audit")
@@ -114,7 +116,7 @@ def test_durable_event_cursor_survives_restart():
     with tempfile.TemporaryDirectory() as td:
         db = Path(td) / "native.db"
         world, events, store, tasks, ops = build_persistent_core(db)
-        tasks.create("x", ("done",))
+        tasks.create("x", ("done",), workspace_id="ws")
         emitted = events.flush_outbox()
         assert emitted
         events.ack("memory", emitted[-1].sequence)
@@ -136,18 +138,18 @@ def test_policy_uses_authoritative_action_risk_before_operation_creation():
             allowed_capabilities=frozenset({"files"})
         )})
 
-        read_task = tasks.create("read", ("done",))
+        read_task = tasks.create("read", ("done",), workspace_id="ws")
         read_task.desired_state = TaskState.RUNNING
         NativeAgentRunner(
-            tasks, ops, Model("read"), policy, workspace_id="ws"
+            tasks, ops, Model("read"), policy
         ).step(read_task, build_manifest(read_task, world.revisions, refs))
         assert len(ops.operations) == 1
 
-        write_task = tasks.create("write", ("done",))
+        write_task = tasks.create("write", ("done",), workspace_id="ws")
         write_task.desired_state = TaskState.RUNNING
         before = len(ops.operations)
         NativeAgentRunner(
-            tasks, ops, Model("write", {"content": "x"}), policy, workspace_id="ws"
+            tasks, ops, Model("write", {"content": "x"}), policy
         ).step(write_task, build_manifest(write_task, world.revisions, refs))
         assert write_task.state is TaskState.WAITING
         assert len(ops.operations) == before
@@ -163,10 +165,29 @@ def test_action_schema_blocks_path_smuggling():
         registry().resolve(proposal)
 
 
+def test_workspace_scope_blocks_cross_workspace_object_ref():
+    with tempfile.TemporaryDirectory() as td:
+        world, events, store, tasks, ops = build_persistent_core(Path(td) / "native.db")
+        world.register(Entity(
+            "file_other", "file", "other", "/other/secret.txt",
+            permissions=frozenset({"read"}),
+        ))
+        ops.capabilities["files"] = Capability()
+        task = tasks.create("read other", ("done",), workspace_id="ws")
+        proposal = ActionProposal("p", "files", "read", ("file_other",))
+        op = ops.prepare(
+            task, proposal,
+            expected_revisions={"workspace": world.revisions.workspace},
+        )
+        with pytest.raises(PermissionError):
+            ops.execute(op)
+        store.close()
+
+
 def test_cancel_request_does_not_claim_actual_cancel_until_safe_boundary():
     with tempfile.TemporaryDirectory() as td:
         world, events, store, tasks, ops = build_persistent_core(Path(td) / "native.db")
-        task = tasks.create("long", ("done",))
+        task = tasks.create("long", ("done",), workspace_id="ws")
         task.state = TaskState.RUNNING
         task.desired_state = TaskState.RUNNING
         store.save_task(task)

@@ -55,8 +55,18 @@ class WorldModel:
             raise EntityVersionConflict(f"{ref}: expected {expected_version}, actual {entity.version}")
         return entity
 
-    def resolve_locator(self, ref: str, permission: str) -> str:
+    def resolve_locator(
+        self,
+        ref: str,
+        permission: str,
+        *,
+        workspace_id: str | None = None,
+    ) -> str:
         entity = self.get(ref)
+        if workspace_id is not None and entity.workspace_id != workspace_id:
+            raise PermissionError(
+                f"{ref} belongs to workspace {entity.workspace_id}, not {workspace_id}"
+            )
         if permission not in entity.permissions:
             raise PermissionError(f"{ref} lacks {permission}")
         return entity.locator
