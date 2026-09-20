@@ -42,6 +42,7 @@ class RecoveryCoordinator:
 
         for op in list(self.operations.operations.values()):
             if op.state in {
+                OperationState.PREPARED,
                 OperationState.RUNNING,
                 OperationState.UNKNOWN,
                 OperationState.RECONCILING,

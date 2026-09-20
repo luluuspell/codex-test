@@ -82,6 +82,10 @@ class OperationRuntime:
     def prepare(self, task: Task, proposal: ActionProposal, *, expected_revisions: dict[str, int]) -> Operation:
         spec = self.registry.resolve(proposal)
         self.world.assert_revisions(expected_revisions)
+        for ref in proposal.object_refs:
+            self.world.assert_access(
+                ref, spec.required_permission, workspace_id=task.workspace_id
+            )
         op = Operation(
             operation_id=new_id("op"), task_id=task.task_id,
             workspace_id=task.workspace_id,
@@ -144,6 +148,13 @@ class OperationRuntime:
         return self._verify(op, capability)
 
     def recover_operation(self, op: Operation) -> Operation:
+        if op.state is OperationState.PREPARED:
+            op.state = OperationState.CANCELLED
+            self._record(
+                op, "operation.abandoned_prepared", "recovery",
+                {"reason": "no external execution was recorded before restart"},
+            )
+            return op
         capability = self.capabilities[op.capability]
         if op.state in {OperationState.OBSERVED, OperationState.VERIFYING} and op.result is not None:
             return self._verify(op, capability)

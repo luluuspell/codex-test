@@ -165,6 +165,20 @@ def test_action_schema_blocks_path_smuggling():
         registry().resolve(proposal)
 
 
+def test_action_schema_blocks_nested_locator_smuggling():
+    custom = CapabilityRegistry()
+    custom.register(ActionSpec(
+        "files", "read", RiskClass.READ, "read",
+        allowed_arguments=frozenset({"options"}),
+    ))
+    proposal = ActionProposal(
+        "p", "files", "read", ("file_A",),
+        {"options": {"locator": "/Users/secret.txt"}},
+    )
+    with pytest.raises(InvalidAction):
+        custom.resolve(proposal)
+
+
 def test_workspace_scope_blocks_cross_workspace_object_ref():
     with tempfile.TemporaryDirectory() as td:
         world, events, store, tasks, ops = build_persistent_core(Path(td) / "native.db")
@@ -175,12 +189,12 @@ def test_workspace_scope_blocks_cross_workspace_object_ref():
         ops.capabilities["files"] = Capability()
         task = tasks.create("read other", ("done",), workspace_id="ws")
         proposal = ActionProposal("p", "files", "read", ("file_other",))
-        op = ops.prepare(
-            task, proposal,
-            expected_revisions={"workspace": world.revisions.workspace},
-        )
         with pytest.raises(PermissionError):
-            ops.execute(op)
+            ops.prepare(
+                task, proposal,
+                expected_revisions={"workspace": world.revisions.workspace},
+            )
+        assert ops.operations == {}
         store.close()
 
 
@@ -197,3 +211,30 @@ def test_cancel_request_does_not_claim_actual_cancel_until_safe_boundary():
         tasks.settle_control(task.task_id, safe_boundary=True)
         assert task.state is TaskState.CANCELLED
         store.close()
+
+
+def test_prepared_operation_is_abandoned_on_restart_without_reconcile():
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "native.db"
+        world, events, store, tasks, ops = build_persistent_core(db)
+        ops.capabilities["files"] = Capability()
+        task = tasks.create("read", ("done",), workspace_id="ws")
+        proposal = ActionProposal("p", "files", "read", ("file_A",))
+        op = ops.prepare(
+            task, proposal,
+            expected_revisions={"workspace": world.revisions.workspace},
+        )
+        assert op.state is OperationState.PREPARED
+        store.close()
+
+        store2 = SQLiteStore(db)
+        coordinator = RecoveryCoordinator.from_store(
+            store2, registry=registry(), capabilities={"files": Capability()}
+        )
+        result = coordinator.recover()
+        recovered = coordinator.operations.operations[op.operation_id]
+        assert result["operations_reconciled"] == 1
+        assert recovered.state is OperationState.CANCELLED
+        events_after = coordinator.operations.events.read_after("audit-prepared")
+        assert any(e.event_type == "operation.abandoned_prepared" for e in events_after)
+        store2.close()

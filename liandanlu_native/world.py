@@ -55,6 +55,22 @@ class WorldModel:
             raise EntityVersionConflict(f"{ref}: expected {expected_version}, actual {entity.version}")
         return entity
 
+    def assert_access(
+        self,
+        ref: str,
+        permission: str,
+        *,
+        workspace_id: str,
+    ) -> Entity:
+        entity = self.get(ref)
+        if entity.workspace_id != workspace_id:
+            raise PermissionError(
+                f"{ref} belongs to workspace {entity.workspace_id}, not {workspace_id}"
+            )
+        if permission not in entity.permissions:
+            raise PermissionError(f"{ref} lacks {permission}")
+        return entity
+
     def resolve_locator(
         self,
         ref: str,
@@ -62,13 +78,12 @@ class WorldModel:
         *,
         workspace_id: str | None = None,
     ) -> str:
-        entity = self.get(ref)
-        if workspace_id is not None and entity.workspace_id != workspace_id:
-            raise PermissionError(
-                f"{ref} belongs to workspace {entity.workspace_id}, not {workspace_id}"
-            )
-        if permission not in entity.permissions:
-            raise PermissionError(f"{ref} lacks {permission}")
+        if workspace_id is None:
+            entity = self.get(ref)
+            if permission not in entity.permissions:
+                raise PermissionError(f"{ref} lacks {permission}")
+        else:
+            entity = self.assert_access(ref, permission, workspace_id=workspace_id)
         return entity.locator
 
     def assert_revisions(self, expected: dict[str, int]) -> None:
