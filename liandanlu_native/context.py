@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from .models import Task, WorldRevisions, new_id
+from .models import Task, new_id
+from .world import WorldModel
 
 
 @dataclass(slots=True)
@@ -54,11 +55,12 @@ class ContextManifest:
     excluded: tuple[tuple[str, str], ...]
 
 
-def build_manifest(task: Task, revisions: WorldRevisions, referents: ReferentStack, *, focus: Iterable[str] = (), fact_refs: Iterable[str] = (), episode_refs: Iterable[str] = (), strategy_refs: Iterable[str] = (), event_range: tuple[int | None, int | None] = (None, None), brain_snapshot_ref: str | None = None, excluded: Iterable[tuple[str, str]] = ()) -> ContextManifest:
+def build_manifest(task: Task, world: WorldModel, referents: ReferentStack, *, focus: Iterable[str] = (), fact_refs: Iterable[str] = (), episode_refs: Iterable[str] = (), strategy_refs: Iterable[str] = (), event_range: tuple[int | None, int | None] = (None, None), brain_snapshot_ref: str | None = None, excluded: Iterable[tuple[str, str]] = ()) -> ContextManifest:
+    revisions = world.revisions
     return ContextManifest(
         manifest_id=new_id("ctx"), task_id=task.task_id,
         workspace_id=task.workspace_id,
-        world_revisions={"global_revision": revisions.global_revision, "desktop": revisions.desktop, "workspace": revisions.workspace, "browser": revisions.browser, "media": revisions.media, "tasks": revisions.tasks},
+        world_revisions={"global_revision": revisions.global_revision, "desktop": revisions.desktop, "workspace": world.workspace_revision(task.workspace_id), "browser": revisions.browser, "media": revisions.media, "tasks": revisions.tasks},
         focus_object_refs=tuple(focus),
         referent_refs=tuple(x.object_ref for x in referents.items[:8]),
         fact_memory_refs=tuple(fact_refs), episode_memory_refs=tuple(episode_refs), strategy_memory_refs=tuple(strategy_refs),

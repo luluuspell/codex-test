@@ -74,10 +74,10 @@ def test_context_referent_ambiguity_and_manifest_freezes_revisions():
     refs = ReferentStack()
     refs.push("file_A", "selection", 0.95)
     task = tasks.create("read it", ("read_done",), workspace_id="ws")
-    manifest = build_manifest(task, world.revisions, refs, focus=("file_A",))
+    manifest = build_manifest(task, world, refs, focus=("file_A",))
     assert refs.resolve() == "file_A"
     assert manifest.workspace_id == "ws"
-    assert manifest.world_revisions["workspace"] == world.revisions.workspace
+    assert manifest.world_revisions["workspace"] == world.workspace_revision("ws")
     refs.push("file_B", "recent", 0.90)
     refs.push("file_A", "selection", 0.95)
     assert refs.resolve(ambiguity_gap=0.10) is None
@@ -87,8 +87,11 @@ def test_world_domain_revision_blocks_stale_operation():
     world, events, tasks, ops = make_core()
     task = tasks.create("read", ("read_done",), workspace_id="ws")
     proposal = ActionProposal("p", "files", "read", ("file_A",))
-    expected = {"workspace": world.revisions.workspace}
-    world.observe("desktop", "selection", {"ref": "file_A"}, "workspace")
+    expected = {"workspace": world.workspace_revision("ws")}
+    world.observe(
+        "desktop", "selection", {"ref": "file_A"}, "workspace",
+        workspace_id="ws",
+    )
     with pytest.raises(StaleWorld):
         ops.prepare(task, proposal, expected_revisions=expected)
 
@@ -100,7 +103,7 @@ def test_agent_uses_object_ref_policy_and_verifier():
     task.desired_state = TaskState.RUNNING
     refs = ReferentStack()
     refs.push("file_A", "selection")
-    manifest = build_manifest(task, world.revisions, refs)
+    manifest = build_manifest(task, world, refs)
     policy = PolicyEngine({"ws": WorkspacePolicy(
         allowed_capabilities=frozenset({"files"})
     )})
@@ -122,7 +125,7 @@ def test_unknown_operation_is_reconciled_after_failure():
     task.state = TaskState.RUNNING
     proposal = ActionProposal("p", "files", "read", ("file_A",))
     op = ops.prepare(
-        task, proposal, expected_revisions={"workspace": world.revisions.workspace}
+        task, proposal, expected_revisions={"workspace": world.workspace_revision("ws")}
     )
     ops.execute(op)
     assert op.state is OperationState.UNKNOWN

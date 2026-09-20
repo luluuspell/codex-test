@@ -6,7 +6,7 @@ from typing import Protocol
 from .context import ContextManifest
 from .models import ActionProposal, OperationState, Task, TaskPhase, TaskState
 from .policy import PolicyDecision, PolicyEngine
-from .runtime import OperationRuntime, TaskRuntime
+from .runtime import BudgetExceeded, OperationRuntime, TaskRuntime
 
 
 class CognitiveModel(Protocol):
@@ -58,9 +58,17 @@ class NativeAgentRunner:
             )
             return
 
-        op = self.operations.prepare(
-            task, proposal, expected_revisions=expected_revisions
-        )
+        try:
+            op = self.operations.prepare(
+                task, proposal, expected_revisions=expected_revisions
+            )
+        except BudgetExceeded as exc:
+            self.tasks.wait(
+                task.task_id,
+                f"budget:{exc.reason}",
+                event_type="task.budget_exhausted",
+            )
+            return
         self.tasks.update_runtime_state(
             task.task_id, phase=TaskPhase.EXECUTING,
             event_type="task.executing",

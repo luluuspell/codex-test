@@ -7,8 +7,8 @@ from typing import Protocol, Any
 from .capabilities import CapabilityRegistry
 from .events import EventStore
 from .models import (
-    ActionProposal, GoalClaim, Operation, OperationState, Task, TaskPhase,
-    TaskState, new_id, now,
+    ActionProposal, GoalClaim, Operation, OperationState, Task, TaskBudget,
+    TaskLease, TaskPhase, TaskState, new_id, now,
 )
 from .world import WorldModel
 
@@ -24,6 +24,22 @@ class RuntimePersistence(Protocol):
     def save_task_with_outbox_event(self, task: Task, **event_kwargs) -> str: ...
     def save_operation(self, op: Operation) -> None: ...
     def save_operation_with_outbox_event(self, op: Operation, **event_kwargs) -> str: ...
+    def save_task_and_operation_with_outbox_event(
+        self, task: Task, op: Operation, **event_kwargs
+    ) -> str: ...
+    def claim_next_task(
+        self, owner_id: str, *, lease_seconds: float, now_ts: float | None = None
+    ) -> TaskLease | None: ...
+    def renew_task_lease(
+        self, lease: TaskLease, *, lease_seconds: float, now_ts: float | None = None
+    ) -> TaskLease | None: ...
+    def release_task_lease(self, lease: TaskLease) -> bool: ...
+
+
+class BudgetExceeded(RuntimeError):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 @dataclass
@@ -36,6 +52,7 @@ class TaskScheduler:
     tasks: "TaskRuntime"
     interactive: list[tuple[int, float, str]] = field(default_factory=list)
     background: list[tuple[int, float, str]] = field(default_factory=list)
+    _leases: dict[str, TaskLease] = field(default_factory=dict)
 
     @classmethod
     def rebuild(cls, tasks: "TaskRuntime") -> "TaskScheduler":
@@ -81,6 +98,68 @@ class TaskScheduler:
         return self._pop_valid(self.background)
 
 
+    def claim_next(
+        self,
+        owner_id: str,
+        *,
+        lease_seconds: float = 30.0,
+        now_ts: float | None = None,
+    ) -> TaskLease | None:
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        if self.tasks.persistence is not None:
+            return self.tasks.persistence.claim_next_task(
+                owner_id, lease_seconds=lease_seconds, now_ts=now_ts
+            )
+        task_id = self.next_task()
+        if task_id is None:
+            return None
+        ts = now() if now_ts is None else now_ts
+        previous = self._leases.get(task_id)
+        generation = 1 if previous is None else previous.generation + 1
+        lease = TaskLease(task_id, owner_id, generation, ts, ts + lease_seconds)
+        self._leases[task_id] = lease
+        return lease
+
+    def renew(
+        self,
+        lease: TaskLease,
+        *,
+        lease_seconds: float = 30.0,
+        now_ts: float | None = None,
+    ) -> TaskLease | None:
+        if self.tasks.persistence is not None:
+            return self.tasks.persistence.renew_task_lease(
+                lease, lease_seconds=lease_seconds, now_ts=now_ts
+            )
+        current = self._leases.get(lease.task_id)
+        ts = now() if now_ts is None else now_ts
+        if (
+            current is None
+            or current.owner_id != lease.owner_id
+            or current.generation != lease.generation
+            or current.lease_until <= ts
+        ):
+            return None
+        renewed = TaskLease(
+            lease.task_id, lease.owner_id, lease.generation,
+            lease.claimed_at, ts + lease_seconds,
+        )
+        self._leases[lease.task_id] = renewed
+        return renewed
+
+    def release(self, lease: TaskLease) -> bool:
+        if self.tasks.persistence is not None:
+            return self.tasks.persistence.release_task_lease(lease)
+        current = self._leases.get(lease.task_id)
+        if current is None:
+            return False
+        if current.owner_id != lease.owner_id or current.generation != lease.generation:
+            return False
+        del self._leases[lease.task_id]
+        return True
+
+
 @dataclass
 class OperationRuntime:
     world: WorldModel
@@ -116,7 +195,9 @@ class OperationRuntime:
 
     def prepare(self, task: Task, proposal: ActionProposal, *, expected_revisions: dict[str, int]) -> Operation:
         spec = self.registry.resolve(proposal)
-        self.world.assert_revisions(expected_revisions)
+        self.world.assert_revisions(
+            expected_revisions, workspace_id=task.workspace_id
+        )
         for ref in proposal.object_refs:
             self.world.assert_access(
                 ref, spec.required_permission, workspace_id=task.workspace_id
@@ -132,8 +213,35 @@ class OperationRuntime:
             state=OperationState.PREPARED,
             expected_revisions=dict(expected_revisions),
         )
+        reason = task.budget.block_reason(now())
+        if reason is not None:
+            raise BudgetExceeded(reason)
+        task.budget.operations_started += 1
+        task.revision += 1
+        self.world.revisions.bump("tasks")
+        if self.world.persistence:
+            self.world.persistence.save_world_revisions(self.world.revisions)
+
         self.operations[op.operation_id] = op
-        self._record(op, "operation.prepared", "engine")
+        if self.persistence:
+            self.persistence.save_task_and_operation_with_outbox_event(
+                task, op, event_type="operation.prepared", actor="engine",
+                workspace_id=op.workspace_id,
+                payload={
+                    "budget_operations_started": task.budget.operations_started,
+                    "budget_max_operations": task.budget.max_operations,
+                },
+            )
+        else:
+            self.events.enqueue_outbox(
+                event_type="operation.prepared", actor="engine",
+                workspace_id=op.workspace_id, task_id=op.task_id,
+                operation_id=op.operation_id, object_refs=op.object_refs,
+                payload={
+                    "budget_operations_started": task.budget.operations_started,
+                    "budget_max_operations": task.budget.max_operations,
+                },
+            )
         return op
 
     def _verify(self, op: Operation, capability: Capability) -> Operation:
@@ -161,7 +269,9 @@ class OperationRuntime:
 
     def execute(self, op: Operation) -> Operation:
         capability = self.capabilities[op.capability]
-        self.world.assert_revisions(op.expected_revisions)
+        self.world.assert_revisions(
+            op.expected_revisions, workspace_id=op.workspace_id
+        )
         locators = tuple(
             self.world.resolve_locator(
                 ref, op.required_permission, workspace_id=op.workspace_id
@@ -259,11 +369,13 @@ class TaskRuntime:
         constraints: tuple[str, ...] = (),
         lane: str = "background",
         priority: int = 50,
+        budget: TaskBudget | None = None,
     ) -> Task:
         task = Task(
             task_id=new_id("task"), workspace_id=workspace_id, goal=goal,
             success_criteria=success_criteria, constraints=constraints,
             lane=lane, priority=priority,
+            budget=budget if budget is not None else TaskBudget(),
         )
         self.tasks[task.task_id] = task
         self.world.revisions.bump("tasks")
@@ -287,6 +399,17 @@ class TaskRuntime:
                 "priority": task.priority,
                 "queued_at": task.queued_at,
             },
+        )
+        return task
+
+    def wait(self, task_id: str, reason: str, *, event_type: str = "task.waiting") -> Task:
+        task = self.tasks[task_id]
+        task.state = TaskState.WAITING
+        task.wait_reason = reason
+        self._touch(task)
+        self._record(
+            task, event_type, "engine",
+            {"reason": reason, "state": task.state.value},
         )
         return task
 
@@ -323,6 +446,7 @@ class TaskRuntime:
             else:
                 task.state = TaskState.CANCELLED
         elif desired == TaskState.RUNNING:
+            task.wait_reason = None
             if task.state in {
                 TaskState.PAUSED, TaskState.PAUSING, TaskState.WAITING,
                 TaskState.QUEUED, TaskState.CREATED,

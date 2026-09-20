@@ -78,6 +78,29 @@ class WorldRevisions:
 
 
 @dataclass(slots=True)
+class TaskBudget:
+    max_operations: int = 64
+    operations_started: int = 0
+    deadline_at: float | None = None
+
+    def block_reason(self, at: float) -> str | None:
+        if self.max_operations >= 0 and self.operations_started >= self.max_operations:
+            return "max_operations"
+        if self.deadline_at is not None and at >= self.deadline_at:
+            return "deadline"
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class TaskLease:
+    task_id: str
+    owner_id: str
+    generation: int
+    claimed_at: float
+    lease_until: float
+
+
+@dataclass(slots=True)
 class Entity:
     entity_id: str
     entity_type: str
@@ -102,6 +125,8 @@ class Task:
     priority: int = 50
     lane: str = "background"
     queued_at: float | None = None
+    wait_reason: str | None = None
+    budget: TaskBudget = field(default_factory=TaskBudget)
     revision: int = 1
 
 
