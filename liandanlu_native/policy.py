@@ -16,8 +16,12 @@ class PolicyDecision(str, Enum):
 class WorkspacePolicy:
     allowed_capabilities: frozenset[str] = frozenset()
     denied_actions: frozenset[str] = frozenset()
-    confirm_risks: frozenset[RiskClass] = frozenset({RiskClass.EXTERNAL, RiskClass.DESTRUCTIVE})
-    allow_risks: frozenset[RiskClass] = frozenset({RiskClass.READ, RiskClass.REVERSIBLE, RiskClass.MUTATING})
+    confirm_risks: frozenset[RiskClass] = frozenset({
+        RiskClass.MUTATING, RiskClass.EXTERNAL, RiskClass.DESTRUCTIVE
+    })
+    allow_risks: frozenset[RiskClass] = frozenset({
+        RiskClass.READ, RiskClass.REVERSIBLE
+    })
 
 
 @dataclass
@@ -25,10 +29,12 @@ class PolicyEngine:
     policies: dict[str, WorkspacePolicy] = field(default_factory=dict)
 
     def evaluate(self, workspace_id: str, capability: str, action: str, risk: RiskClass) -> PolicyDecision:
-        policy = self.policies.get(workspace_id, WorkspacePolicy())
+        policy = self.policies.get(workspace_id)
+        if policy is None:
+            return PolicyDecision.DENY
         if action in policy.denied_actions:
             return PolicyDecision.DENY
-        if policy.allowed_capabilities and capability not in policy.allowed_capabilities:
+        if capability not in policy.allowed_capabilities:
             return PolicyDecision.DENY
         if risk in policy.confirm_risks:
             return PolicyDecision.REQUIRE_CONFIRMATION

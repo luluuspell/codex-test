@@ -20,7 +20,9 @@ class TaskState(str, Enum):
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
     WAITING = "WAITING"
+    PAUSING = "PAUSING"
     PAUSED = "PAUSED"
+    CANCELLING = "CANCELLING"
     BLOCKED = "BLOCKED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
@@ -69,7 +71,7 @@ class WorldRevisions:
     tasks: int = 0
 
     def bump(self, domain: str) -> None:
-        if not hasattr(self, domain):
+        if domain == "global_revision" or not hasattr(self, domain):
             raise KeyError(domain)
         setattr(self, domain, getattr(self, domain) + 1)
         self.global_revision += 1
@@ -110,6 +112,8 @@ class Operation:
     object_refs: tuple[str, ...]
     arguments: dict[str, Any]
     risk_class: RiskClass
+    required_permission: str = "read"
+    idempotency_mode: str = "RECONCILABLE"
     state: OperationState = OperationState.PROPOSED
     expected_revisions: dict[str, int] = field(default_factory=dict)
     evidence: list[dict[str, Any]] = field(default_factory=list)
@@ -130,6 +134,7 @@ class Event:
     causation_id: str | None
     correlation_id: str | None
     occurred_at: float
+    observed_at: float
     learning_allowed: bool = True
 
 
@@ -142,3 +147,10 @@ class ActionProposal:
     arguments: dict[str, Any] = field(default_factory=dict)
     expected_outcome: str = ""
     confidence: float = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class GoalClaim:
+    criterion: str
+    passed: bool
+    evidence_refs: tuple[str, ...]

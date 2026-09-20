@@ -1,38 +1,37 @@
-# Liandanlu Native Companion Core — 0.5.0a2
+# Liandanlu Native Companion Core — 0.5.0a3 Runtime Integrity
 
-Clean, dependency-light reference implementation for the native Liandanlu Agent runtime.
+This branch hardens the native Liandanlu Agent runtime around a single-authority model.
 
-## Core authorities
+## Runtime authorities
 
-- **WorldModel** — current world truth and domain revisions.
-- **Object Registry / Graph** — stable entity identity, locator indirection, version and permission boundary.
-- **TaskRuntime** — goal lifecycle, desired/actual control state, success criteria.
+- **WorldModel** — current world truth, object identity/relations and domain revisions.
+- **TaskRuntime** — goal lifecycle and truthful desired-vs-actual control state.
 - **OperationRuntime** — every real-world side effect, evidence, verification and reconciliation.
-- **EventStore** — append-only event history with transactional-outbox semantics and consumer cursors.
-- **MemoryStore** — source-backed facts, episodes and strategies; no one-off behavior becomes a global preference.
-- **RuntimeSupervisor** — service lifecycle/health only; never owns business task state.
+- **CapabilityRegistry** — authoritative action schema, risk class, permission and idempotency contract.
+- **SQLiteStore** — single-node durable authority for tasks, operations, world identity, event outbox, event log and consumer cursors.
+- **EventStore** — facade over the durable log; it has no competing in-memory outbox when persistence is attached.
+- **MemoryStore** — source-backed fact/episode/strategy reference pipeline.
+- **RuntimeSupervisor** — process generation, health, heartbeat, deadlines and controlled shutdown.
 
-The cognitive model is intentionally **not** an authority. It only emits structured `ActionProposal` values. It cannot directly set world state, mark operations verified, or complete tasks.
+The cognitive model only emits structured ActionProposal values. It cannot choose its own risk class, pass raw locators through registered action schemas, mark operations verified, or complete a task without evidence-backed goal claims.
 
-## Current a2 scope
+## a3 integrity work
 
-Implemented in this development slice:
+- removed the dual-outbox production path;
+- durable append-only events and durable consumer cursors;
+- persistent WorldModel entities, relations and revisions;
+- restart hydration of world/task/operation state followed by reconciliation;
+- PREPARED is no longer treated as evidence that an external side effect ran;
+- actual/desired task control uses PAUSING/CANCELLING intermediate states;
+- ActionSpec makes risk/permission/schema authoritative outside the model;
+- raw path/locator/shell-style argument smuggling is rejected by default;
+- default policy is deny; mutating/external/destructive actions require confirmation unless policy is explicitly changed;
+- goal completion requires evidence references;
+- scheduler activates priority inside interactive/background lanes;
+- supervisor now manages subprocess lifecycle and rejects stale-generation heartbeats.
 
-- domain-specific WorldState revisions;
-- ObjectRef-only agent boundary;
-- referent stack and ambiguity handling;
-- ContextManifest snapshots;
-- interactive/background task scheduling;
-- explicit Task and Operation state machines;
-- prepare → execute → observe → verify → reconcile;
-- unknown-result recovery;
-- goal evaluation separate from operation verification;
-- event outbox and independent consumer cursors;
-- service generation and three-level health model;
-- control-intent resolver;
-- source-backed Fact/Episode/Strategy memory pipeline;
-- MaleCNS event-consumer cursor/lag contract.
+## Verification boundary
 
-## Verification
+CI runs clean-checkout tests on Linux Python 3.11/3.13 and macOS Python 3.13, treats warnings as errors, compiles the package, records coverage and enforces a minimum coverage threshold.
 
-CI runs on Python 3.13 and installs/tests the package from a clean checkout. This repository is a focused 0.5.0a2 implementation surface; it is not yet the complete historical Liandanlu distribution and does not imply macOS target verification.
+This is still a Native Core development branch, not a claim that real macOS Desktop Bridge actions, realtime voice, WEB/COMMERCE/VIDEO providers or MaleCNS neural computation are product-complete.
