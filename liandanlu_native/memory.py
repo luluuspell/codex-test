@@ -20,8 +20,13 @@ class StrategyState(str, Enum):
     REJECTED = "REJECTED"
 
 
+def memory_partition(workspace_id: str, scope: str) -> str:
+    return "*" if scope == "global" else workspace_id
+
+
 @dataclass(slots=True)
 class MemoryCandidate:
+    workspace_id: str
     kind: MemoryKind
     key: str
     value: Any
@@ -34,6 +39,7 @@ class MemoryCandidate:
 @dataclass(slots=True)
 class MemoryRecord:
     memory_id: str
+    workspace_id: str
     kind: MemoryKind
     key: str
     value: Any
@@ -44,6 +50,7 @@ class MemoryRecord:
     supersedes: str | None = None
     strategy_state: StrategyState | None = None
     support_count: int = 1
+    support_event_ids: tuple[str, ...] = ()
 
 
 class MemoryPersistence(Protocol):
@@ -58,7 +65,7 @@ class MemoryPersistence(Protocol):
 class MemoryStore:
     persistence: MemoryPersistence | None = None
     records: dict[str, MemoryRecord] = field(default_factory=dict)
-    latest_by_key: dict[tuple[str, str, MemoryKind], str] = field(default_factory=dict)
+    latest_by_key: dict[tuple[str, str, str, MemoryKind], str] = field(default_factory=dict)
     processed_event_ids: set[str] = field(default_factory=set)
 
     @classmethod
@@ -66,7 +73,7 @@ class MemoryStore:
         store = cls(persistence=persistence)
         for record in persistence.load_memory_records():
             store.records[record.memory_id] = record
-            key = (record.scope, record.key, record.kind)
+            key = (record.workspace_id, record.scope, record.key, record.kind)
             current_id = store.latest_by_key.get(key)
             current = store.records.get(current_id) if current_id else None
             if current is None or record.revision > current.revision:
@@ -74,7 +81,7 @@ class MemoryStore:
         return store
 
     def _validate(self, candidate: MemoryCandidate) -> bool:
-        if not candidate.source_event_ids:
+        if not candidate.source_event_ids or not candidate.workspace_id:
             return False
         if not 0.0 <= candidate.confidence <= 1.0:
             return False
@@ -90,20 +97,25 @@ class MemoryStore:
     ) -> MemoryRecord | None:
         if not self._validate(candidate):
             return None
+        partition = memory_partition(candidate.workspace_id, candidate.scope)
+        candidate.workspace_id = partition
         if source_event is not None and self.persistence is not None:
             record = self.persistence.process_memory_event(source_event, candidate)
             if record is not None:
                 self.records[record.memory_id] = record
-                self.latest_by_key[(record.scope, record.key, record.kind)] = record.memory_id
+                self.latest_by_key[
+                    (record.workspace_id, record.scope, record.key, record.kind)
+                ] = record.memory_id
             return record
 
-        key = (candidate.scope, candidate.key, candidate.kind)
+        key = (partition, candidate.scope, candidate.key, candidate.kind)
         previous_id = self.latest_by_key.get(key)
         previous = self.records.get(previous_id) if previous_id else None
         revision = 1 if previous is None else previous.revision + 1
         state = StrategyState.CANDIDATE if candidate.kind is MemoryKind.STRATEGY else None
         record = MemoryRecord(
-            memory_id=new_id("mem"), kind=candidate.kind, key=candidate.key,
+            memory_id=new_id("mem"), workspace_id=partition,
+            kind=candidate.kind, key=candidate.key,
             value=candidate.value, scope=candidate.scope,
             source_event_ids=candidate.source_event_ids,
             confidence=candidate.confidence, revision=revision,
@@ -124,14 +136,20 @@ class MemoryStore:
         self,
         memory_id: str,
         *,
-        independent_evidence: bool = True,
+        evidence_event_id: str | None = None,
         user_confirmed: bool = False,
     ) -> MemoryRecord:
         record = self.records[memory_id]
         if record.kind is not MemoryKind.STRATEGY:
             raise ValueError("not a strategy memory")
-        if independent_evidence:
+        support = list(record.support_event_ids)
+        if evidence_event_id is not None and evidence_event_id not in support:
+            support.append(evidence_event_id)
+            record.support_event_ids = tuple(support)
             record.support_count += 1
+        elif evidence_event_id is None and not user_confirmed:
+            raise ValueError("strategy support requires evidence_event_id or user confirmation")
+
         if user_confirmed or record.support_count >= 3:
             record.strategy_state = StrategyState.PROMOTED
         elif record.support_count >= 2:
@@ -140,8 +158,15 @@ class MemoryStore:
             self.persistence.save_memory_record(record)
         return record
 
-    def latest(self, scope: str, key: str, kind: MemoryKind) -> MemoryRecord | None:
-        memory_id = self.latest_by_key.get((scope, key, kind))
+    def latest(
+        self,
+        workspace_id: str,
+        scope: str,
+        key: str,
+        kind: MemoryKind,
+    ) -> MemoryRecord | None:
+        partition = memory_partition(workspace_id, scope)
+        memory_id = self.latest_by_key.get((partition, scope, key, kind))
         return self.records.get(memory_id) if memory_id else None
 
 
@@ -164,14 +189,16 @@ class MemoryPipeline:
             return None
         if not key or not scope:
             return None
+        explicit = bool(payload.get("explicit_user_statement", False)) and event.actor == "user"
         return MemoryCandidate(
+            workspace_id=event.workspace_id,
             kind=kind,
             key=key,
             value=payload.get("value"),
             scope=scope,
             source_event_ids=(event.event_id,),
             confidence=confidence,
-            explicit_user_statement=bool(payload.get("explicit_user_statement", False)),
+            explicit_user_statement=explicit,
         )
 
     def run_once(self, *, limit: int = 100) -> dict[str, int]:

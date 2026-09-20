@@ -128,6 +128,7 @@ class Operation:
 class Event:
     sequence: int
     event_id: str
+    workspace_id: str
     event_type: str
     actor: str
     task_id: str | None
