@@ -99,6 +99,7 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS event_outbox(
                 outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id TEXT,
+                workspace_id TEXT NOT NULL DEFAULT 'system',
                 event_type TEXT NOT NULL,
                 actor TEXT NOT NULL DEFAULT 'engine',
                 task_id TEXT,
@@ -115,6 +116,7 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS events(
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id TEXT NOT NULL UNIQUE,
+                workspace_id TEXT NOT NULL DEFAULT 'system',
                 event_type TEXT NOT NULL,
                 actor TEXT NOT NULL,
                 task_id TEXT,
@@ -144,6 +146,7 @@ class SQLiteStore:
 
             CREATE TABLE IF NOT EXISTS memory_records(
                 memory_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 key TEXT NOT NULL,
                 value_json TEXT NOT NULL,
@@ -154,10 +157,9 @@ class SQLiteStore:
                 supersedes TEXT,
                 strategy_state TEXT,
                 support_count INTEGER NOT NULL,
-                UNIQUE(scope, key, kind, revision)
+                support_event_ids_json TEXT NOT NULL DEFAULT '[]',
+                UNIQUE(workspace_id, scope, key, kind, revision)
             );
-            CREATE INDEX IF NOT EXISTS idx_memory_latest
-                ON memory_records(scope, key, kind, revision DESC);
             """
         )
         self._ensure_column("tasks", "workspace_id", "TEXT NOT NULL DEFAULT 'default'")
@@ -165,6 +167,8 @@ class SQLiteStore:
         self._ensure_column("operations", "workspace_id", "TEXT NOT NULL DEFAULT 'default'")
         self._ensure_column("operations", "required_permission", "TEXT NOT NULL DEFAULT 'read'")
         self._ensure_column("operations", "idempotency_mode", "TEXT NOT NULL DEFAULT 'RECONCILABLE'")
+        self._ensure_column("event_outbox", "workspace_id", "TEXT NOT NULL DEFAULT 'system'")
+        self._ensure_column("events", "workspace_id", "TEXT NOT NULL DEFAULT 'system'")
         for name, ddl in (
             ("event_id", "TEXT"),
             ("actor", "TEXT NOT NULL DEFAULT 'engine'"),
@@ -175,10 +179,59 @@ class SQLiteStore:
             ("learning_allowed", "INTEGER NOT NULL DEFAULT 1"),
         ):
             self._ensure_column("event_outbox", name, ddl)
+        self._migrate_memory_schema()
         self.conn.commit()
 
+    def _migrate_memory_schema(self) -> None:
+        columns = self._columns("memory_records")
+        if "workspace_id" not in columns:
+            self.conn.executescript(
+                """
+                ALTER TABLE memory_records RENAME TO memory_records_legacy;
+                CREATE TABLE memory_records(
+                    memory_id TEXT PRIMARY KEY,
+                    workspace_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    source_event_ids_json TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    revision INTEGER NOT NULL,
+                    supersedes TEXT,
+                    strategy_state TEXT,
+                    support_count INTEGER NOT NULL,
+                    support_event_ids_json TEXT NOT NULL DEFAULT '[]',
+                    UNIQUE(workspace_id, scope, key, kind, revision)
+                );
+                INSERT INTO memory_records(
+                    memory_id,workspace_id,kind,key,value_json,scope,
+                    source_event_ids_json,confidence,revision,supersedes,
+                    strategy_state,support_count,support_event_ids_json
+                )
+                SELECT
+                    memory_id,'legacy',kind,key,value_json,scope,
+                    source_event_ids_json,confidence,revision,supersedes,
+                    strategy_state,support_count,'[]'
+                FROM memory_records_legacy;
+                DROP TABLE memory_records_legacy;
+                """
+            )
+        else:
+            self._ensure_column(
+                "memory_records", "support_event_ids_json",
+                "TEXT NOT NULL DEFAULT '[]'"
+            )
+        self.conn.execute("DROP INDEX IF EXISTS idx_memory_latest")
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_memory_latest
+            ON memory_records(workspace_id,scope,key,kind,revision DESC)
+            """
+        )
+
     def _insert_outbox(
-        self, *, event_type: str, actor: str, task_id: str | None = None,
+        self, *, event_type: str, actor: str, workspace_id: str = "system", task_id: str | None = None,
         operation_id: str | None = None, object_refs: tuple[str, ...] = (),
         payload: dict[str, Any] | None = None, causation_id: str | None = None,
         correlation_id: str | None = None, learning_allowed: bool = True,
@@ -187,12 +240,12 @@ class SQLiteStore:
         self.conn.execute(
             """
             INSERT INTO event_outbox(
-                event_id,event_type,actor,task_id,operation_id,object_refs_json,
+                event_id,workspace_id,event_type,actor,task_id,operation_id,object_refs_json,
                 payload_json,causation_id,correlation_id,occurred_at,learning_allowed,dispatched
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,0)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0)
             """,
             (
-                event_id, event_type, actor, task_id, operation_id,
+                event_id, workspace_id, event_type, actor, task_id, operation_id,
                 json.dumps(object_refs), json.dumps(payload or {}),
                 causation_id, correlation_id, now(), 1 if learning_allowed else 0,
             ),
@@ -414,13 +467,13 @@ class SQLiteStore:
                 self.conn.execute(
                     """
                     INSERT OR IGNORE INTO events(
-                        event_id,event_type,actor,task_id,operation_id,object_refs_json,
+                        event_id,workspace_id,event_type,actor,task_id,operation_id,object_refs_json,
                         payload_json,causation_id,correlation_id,occurred_at,observed_at,
                         learning_allowed
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
-                        event_id, row["event_type"], row["actor"], row["task_id"],
+                        event_id, row["workspace_id"], row["event_type"], row["actor"], row["task_id"],
                         row["operation_id"], row["object_refs_json"], row["payload_json"],
                         row["causation_id"], row["correlation_id"], occurred_at,
                         observed_at, row["learning_allowed"],
@@ -439,6 +492,7 @@ class SQLiteStore:
     def _row_to_event(self, row: sqlite3.Row) -> Event:
         return Event(
             sequence=row["sequence"], event_id=row["event_id"],
+            workspace_id=row["workspace_id"],
             event_type=row["event_type"], actor=row["actor"],
             task_id=row["task_id"], operation_id=row["operation_id"],
             object_refs=tuple(json.loads(row["object_refs_json"])),
@@ -488,6 +542,7 @@ class SQLiteStore:
         state = StrategyState(row["strategy_state"]) if row["strategy_state"] else None
         return MemoryRecord(
             memory_id=row["memory_id"],
+            workspace_id=row["workspace_id"],
             kind=MemoryKind(row["kind"]),
             key=row["key"],
             value=json.loads(row["value_json"]),
@@ -498,6 +553,7 @@ class SQLiteStore:
             supersedes=row["supersedes"],
             strategy_state=state,
             support_count=row["support_count"],
+            support_event_ids=tuple(json.loads(row["support_event_ids_json"])),
         )
 
     def load_memory_records(self) -> list:
@@ -513,22 +569,24 @@ class SQLiteStore:
             self.conn.execute(
                 """
                 INSERT INTO memory_records(
-                    memory_id,kind,key,value_json,scope,source_event_ids_json,
-                    confidence,revision,supersedes,strategy_state,support_count
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    memory_id,workspace_id,kind,key,value_json,scope,source_event_ids_json,
+                    confidence,revision,supersedes,strategy_state,support_count,
+                    support_event_ids_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(memory_id) DO UPDATE SET
                     value_json=excluded.value_json,
                     confidence=excluded.confidence,
                     strategy_state=excluded.strategy_state,
-                    support_count=excluded.support_count
+                    support_count=excluded.support_count,
+                    support_event_ids_json=excluded.support_event_ids_json
                 """,
                 (
-                    record.memory_id, record.kind.value, record.key,
+                    record.memory_id, record.workspace_id, record.kind.value, record.key,
                     json.dumps(record.value), record.scope,
                     json.dumps(record.source_event_ids), record.confidence,
                     record.revision, record.supersedes,
                     record.strategy_state.value if record.strategy_state else None,
-                    record.support_count,
+                    record.support_count, json.dumps(record.support_event_ids),
                 ),
             )
 
@@ -592,10 +650,10 @@ class SQLiteStore:
             previous = self.conn.execute(
                 """
                 SELECT * FROM memory_records
-                WHERE scope=? AND key=? AND kind=?
+                WHERE workspace_id=? AND scope=? AND key=? AND kind=?
                 ORDER BY revision DESC LIMIT 1
                 """,
-                (candidate.scope, candidate.key, candidate.kind.value),
+                (candidate.workspace_id, candidate.scope, candidate.key, candidate.kind.value),
             ).fetchone()
             revision = 1 if previous is None else previous["revision"] + 1
             state = (
@@ -603,7 +661,8 @@ class SQLiteStore:
                 if candidate.kind is MemoryKind.STRATEGY else None
             )
             record = MemoryRecord(
-                memory_id=new_id("mem"), kind=candidate.kind, key=candidate.key,
+                memory_id=new_id("mem"), workspace_id=candidate.workspace_id,
+                kind=candidate.kind, key=candidate.key,
                 value=candidate.value, scope=candidate.scope,
                 source_event_ids=candidate.source_event_ids,
                 confidence=candidate.confidence, revision=revision,
@@ -613,17 +672,18 @@ class SQLiteStore:
             self.conn.execute(
                 """
                 INSERT INTO memory_records(
-                    memory_id,kind,key,value_json,scope,source_event_ids_json,
-                    confidence,revision,supersedes,strategy_state,support_count
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    memory_id,workspace_id,kind,key,value_json,scope,source_event_ids_json,
+                    confidence,revision,supersedes,strategy_state,support_count,
+                    support_event_ids_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
-                    record.memory_id, record.kind.value, record.key,
+                    record.memory_id, record.workspace_id, record.kind.value, record.key,
                     json.dumps(record.value), record.scope,
                     json.dumps(record.source_event_ids), record.confidence,
                     record.revision, record.supersedes,
                     record.strategy_state.value if record.strategy_state else None,
-                    record.support_count,
+                    record.support_count, json.dumps(record.support_event_ids),
                 ),
             )
             self._advance_consumer_in_transaction(
@@ -636,6 +696,7 @@ class SQLiteStore:
         return [
             {
                 "outbox_id": row["outbox_id"], "event_id": row["event_id"],
+                "workspace_id": row["workspace_id"],
                 "event_type": row["event_type"], "actor": row["actor"],
                 "task_id": row["task_id"], "operation_id": row["operation_id"],
                 "payload": json.loads(row["payload_json"]),

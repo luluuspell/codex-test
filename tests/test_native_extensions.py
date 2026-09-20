@@ -48,35 +48,42 @@ def test_policy_is_default_deny_and_confirms_mutations():
 def test_memory_refuses_unconfirmed_global_inference():
     store = MemoryStore()
     candidate = MemoryCandidate(
-        MemoryKind.FACT, "dark_theme", True, "global", ("e1",), 0.8, False
+        "ws", MemoryKind.FACT, "dark_theme", True, "global", ("e1",), 0.8, False
     )
     assert store.commit(candidate) is None
     candidate.explicit_user_statement = True
-    assert store.commit(candidate) is not None
+    record = store.commit(candidate)
+    assert record is not None
+    assert record.workspace_id == "*"
 
 
 def test_memory_revision_supersedes_without_destroying_old_fact():
     store = MemoryStore()
     r1 = store.commit(MemoryCandidate(
-        MemoryKind.FACT, "price", 299, "project:store", ("e1",), 1.0, True
+        "store", MemoryKind.FACT, "price", 299, "project:store", ("e1",), 1.0, True
     ))
     r2 = store.commit(MemoryCandidate(
-        MemoryKind.FACT, "price", 319, "project:store", ("e2",), 1.0, True
+        "store", MemoryKind.FACT, "price", 319, "project:store", ("e2",), 1.0, True
     ))
     assert r2.revision == 2 and r2.supersedes == r1.memory_id
     assert store.records[r1.memory_id].value == 299
+    assert store.latest("store", "project:store", "price", MemoryKind.FACT).value == 319
 
 
-def test_strategy_requires_accumulated_support_before_promotion():
+def test_strategy_requires_distinct_evidence_before_promotion():
     store = MemoryStore()
     record = store.commit(MemoryCandidate(
-        MemoryKind.STRATEGY, "vite_deploy", "build_first",
+        "web", MemoryKind.STRATEGY, "vite_deploy", "build_first",
         "project:web", ("e1",), 0.7
     ))
     assert record.strategy_state is StrategyState.CANDIDATE
-    store.add_strategy_support(record.memory_id)
+    store.add_strategy_support(record.memory_id, evidence_event_id="e2")
     assert record.strategy_state is StrategyState.SUPPORTED
-    store.add_strategy_support(record.memory_id)
+    support_count = record.support_count
+    store.add_strategy_support(record.memory_id, evidence_event_id="e2")
+    assert record.support_count == support_count
+    assert record.strategy_state is StrategyState.SUPPORTED
+    store.add_strategy_support(record.memory_id, evidence_event_id="e3")
     assert record.strategy_state is StrategyState.PROMOTED
 
 

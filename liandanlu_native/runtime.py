@@ -104,12 +104,13 @@ class OperationRuntime:
     def _record(self, op: Operation, event_type: str, actor: str, payload: dict[str, Any] | None = None) -> None:
         if self.persistence:
             self.persistence.save_operation_with_outbox_event(
-                op, event_type=event_type, actor=actor, payload=payload or {}
+                op, event_type=event_type, actor=actor,
+                workspace_id=op.workspace_id, payload=payload or {}
             )
         else:
             self.events.enqueue_outbox(
-                event_type=event_type, actor=actor, task_id=op.task_id,
-                operation_id=op.operation_id, object_refs=op.object_refs,
+                event_type=event_type, actor=actor, workspace_id=op.workspace_id,
+                task_id=op.task_id, operation_id=op.operation_id, object_refs=op.object_refs,
                 payload=payload or {},
             )
 
@@ -234,12 +235,13 @@ class TaskRuntime:
     def _record(self, task: Task, event_type: str, actor: str, payload: dict[str, Any] | None = None) -> None:
         if self.persistence:
             self.persistence.save_task_with_outbox_event(
-                task, event_type=event_type, actor=actor, payload=payload or {}
+                task, event_type=event_type, actor=actor,
+                workspace_id=task.workspace_id, payload=payload or {}
             )
         else:
             self.events.enqueue_outbox(
-                event_type=event_type, actor=actor, task_id=task.task_id,
-                payload=payload or {},
+                event_type=event_type, actor=actor, workspace_id=task.workspace_id,
+                task_id=task.task_id, payload=payload or {},
             )
 
     def _touch(self, task: Task) -> None:

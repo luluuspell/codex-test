@@ -25,10 +25,10 @@ class EventStore:
     _outbox: list[dict[str, Any]] = field(default_factory=list)
     _cursors: dict[str, int] = field(default_factory=dict)
 
-    def enqueue_outbox(self, *, event_type: str, actor: str, task_id: str | None = None, operation_id: str | None = None, object_refs: tuple[str, ...] = (), payload: dict[str, Any] | None = None, causation_id: str | None = None, correlation_id: str | None = None, learning_allowed: bool = True) -> str:
+    def enqueue_outbox(self, *, event_type: str, actor: str, workspace_id: str = "system", task_id: str | None = None, operation_id: str | None = None, object_refs: tuple[str, ...] = (), payload: dict[str, Any] | None = None, causation_id: str | None = None, correlation_id: str | None = None, learning_allowed: bool = True) -> str:
         if self.persistence:
             return self.persistence.enqueue_event_outbox(
-                event_type=event_type, actor=actor, task_id=task_id,
+                event_type=event_type, actor=actor, workspace_id=workspace_id, task_id=task_id,
                 operation_id=operation_id, object_refs=object_refs,
                 payload=payload or {}, causation_id=causation_id,
                 correlation_id=correlation_id, learning_allowed=learning_allowed,
@@ -36,7 +36,7 @@ class EventStore:
         outbox_id = new_id("outbox")
         self._outbox.append({
             "outbox_id": outbox_id, "event_type": event_type, "actor": actor,
-            "task_id": task_id, "operation_id": operation_id,
+            "workspace_id": workspace_id, "task_id": task_id, "operation_id": operation_id,
             "object_refs": object_refs, "payload": payload or {},
             "causation_id": causation_id, "correlation_id": correlation_id,
             "learning_allowed": learning_allowed,
@@ -52,6 +52,7 @@ class EventStore:
             ts = now()
             ev = Event(
                 sequence=len(self._events) + 1, event_id=new_id("evt"),
+                workspace_id=item["workspace_id"],
                 event_type=item["event_type"], actor=item["actor"],
                 task_id=item["task_id"], operation_id=item["operation_id"],
                 object_refs=tuple(item["object_refs"]), payload=dict(item["payload"]),
