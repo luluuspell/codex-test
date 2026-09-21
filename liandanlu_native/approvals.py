@@ -1,8 +1,8 @@
-"""Durable, request-bound human approval. No model-facing approve tool is exposed.
+"""Durable, request-bound human approval; never exposed as a model tool.
 
-The host must authenticate the human BEFORE calling decide/revoke. Principal
-strings here are trusted host context, not a replacement for UI authentication.
-All approval tables share SQLiteStore's transaction and outbox authority.
+The host authenticates the human BEFORE decide/revoke. Principal strings here
+are trusted host context, not a replacement for UI authentication. Approvals,
+budgets, Operations and events all share one SQLiteStore transaction authority.
 """
 from __future__ import annotations
 
@@ -14,11 +14,8 @@ import json
 import math
 from typing import Any
 
-from .integrity import (
-    TERMINAL_TASKS, StateConflict, _lease, _task_allowed, _world_preflight,
-    copy_record, immediate, unsettled_rows,
-)
-from .models import ActionProposal, Operation, OperationState, TaskState, new_id, now
+from .integrity import StateConflict, _lease, _task_allowed, _world_preflight, copy_record, immediate, unsettled_rows
+from .models import ActionProposal, Operation, new_id, now
 from .policy import PolicyDecision
 
 
@@ -52,32 +49,27 @@ class ApprovalService:
                  human_principals: frozenset[str] = frozenset(), ttl_seconds: float = 600):
         if not math.isfinite(ttl_seconds) or not 0 < ttl_seconds <= 86400:
             raise ValueError('approval TTL must be finite, positive and at most 24 hours')
+        if any(not isinstance(p, str) or not p for p in human_principals):
+            raise ValueError('human principal IDs must be nonempty strings')
         self.store, self.registry, self.policy = store, registry, policy
-        self.human_principals = frozenset(human_principals)
-        self.ttl_seconds = ttl_seconds
+        self.human_principals, self.ttl_seconds = frozenset(human_principals), ttl_seconds
         with immediate(store):
             store.conn.execute('''CREATE TABLE IF NOT EXISTS approval_requests(
                 approval_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
                 workspace_id TEXT NOT NULL, proposal_id TEXT NOT NULL,
                 snapshot_json TEXT NOT NULL, request_digest TEXT NOT NULL,
-                state TEXT NOT NULL CHECK(state IN
-                    ('PENDING','APPROVED','DENIED','REVOKED','CONSUMED')),
-                created_at REAL NOT NULL, expires_at REAL NOT NULL,
-                decided_at REAL, decided_by TEXT,
-                UNIQUE(task_id,proposal_id), FOREIGN KEY(task_id) REFERENCES tasks(task_id)
-            )''')
+                state TEXT NOT NULL CHECK(state IN ('PENDING','APPROVED','DENIED','REVOKED','CONSUMED')),
+                created_at REAL NOT NULL, expires_at REAL NOT NULL, decided_at REAL, decided_by TEXT,
+                UNIQUE(task_id,proposal_id), FOREIGN KEY(task_id) REFERENCES tasks(task_id))''')
             store.conn.execute('''CREATE UNIQUE INDEX IF NOT EXISTS approval_one_open_task
                 ON approval_requests(task_id) WHERE state IN ('PENDING','APPROVED')''')
             store.conn.execute('''CREATE TABLE IF NOT EXISTS approval_operations(
-                operation_id TEXT PRIMARY KEY, approval_id TEXT NOT NULL UNIQUE,
-                request_digest TEXT NOT NULL,
+                operation_id TEXT PRIMARY KEY, approval_id TEXT NOT NULL UNIQUE, request_digest TEXT NOT NULL,
                 FOREIGN KEY(operation_id) REFERENCES operations(operation_id),
-                FOREIGN KEY(approval_id) REFERENCES approval_requests(approval_id)
-            )''')
+                FOREIGN KEY(approval_id) REFERENCES approval_requests(approval_id))''')
 
     def _row(self, approval_id: str) -> Any:
-        row = self.store.conn.execute('SELECT * FROM approval_requests WHERE approval_id=?',
-                                      (approval_id,)).fetchone()
+        row = self.store.conn.execute('SELECT * FROM approval_requests WHERE approval_id=?', (approval_id,)).fetchone()
         if row is None:
             raise ApprovalError('approval not found')
         return row
@@ -85,8 +77,7 @@ class ApprovalService:
     def _event(self, row: Any, event_type: str, actor: str, **extra: Any) -> None:
         self.store._insert_outbox(event_type=event_type, actor=actor,
             workspace_id=row['workspace_id'], task_id=row['task_id'],
-            payload={'approval_id': row['approval_id'],
-                     'request_digest': row['request_digest'], **extra})
+            payload={'approval_id': row['approval_id'], 'request_digest': row['request_digest'], **extra})
 
     def inspect(self, approval_id: str, *, workspace_id: str) -> dict:
         row = self._row(approval_id)
@@ -94,21 +85,17 @@ class ApprovalService:
             raise PermissionError('approval belongs to another workspace')
         value = dict(row)
         value['snapshot'] = json.loads(value.pop('snapshot_json'))
-        if value['state'] in {'PENDING', 'APPROVED'} and value['expires_at'] <= now():
-            value['effective_state'] = 'EXPIRED'
-        else:
-            value['effective_state'] = value['state']
+        value['effective_state'] = ('EXPIRED' if value['state'] in {'PENDING', 'APPROVED'}
+                                    and value['expires_at'] <= now() else value['state'])
         return value
 
     def outstanding(self, task_id: str) -> dict | None:
-        row = self.store.conn.execute('''SELECT * FROM approval_requests
-            WHERE task_id=? AND state IN ('PENDING','APPROVED') ORDER BY created_at DESC LIMIT 1''',
-            (task_id,)).fetchone()
+        row = self.store.conn.execute('''SELECT * FROM approval_requests WHERE task_id=?
+            AND state IN ('PENDING','APPROVED') ORDER BY created_at DESC LIMIT 1''', (task_id,)).fetchone()
         return self.inspect(row['approval_id'], workspace_id=row['workspace_id']) if row else None
 
     def _snapshot(self, op: Operation) -> dict:
-        proposal = ActionProposal('approval-validation', op.capability, op.action,
-                                  tuple(op.object_refs), op.arguments)
+        proposal = ActionProposal('approval-validation', op.capability, op.action, tuple(op.object_refs), op.arguments)
         spec = self.registry.resolve(proposal)
         if (op.risk_class != spec.risk_class or op.required_permission != spec.required_permission
                 or op.idempotency_mode != spec.idempotency_mode.value):
@@ -127,29 +114,24 @@ class ApprovalService:
         entities = []
         for ref in op.object_refs:
             entity = self.store.conn.execute('SELECT * FROM world_entities WHERE entity_id=?', (ref,)).fetchone()
-            # Bind locator, metadata, permissions and version without exposing raw locators to the model/UI.
             entities.append({'ref': ref, 'fingerprint': digest(dict(entity))})
         budget = json.loads(task['budget_json'] or '{}')
         return {
-            'request': {'capability': op.capability, 'action': op.action,
-                        'object_refs': list(op.object_refs), 'arguments': op.arguments,
-                        'expected_revisions': op.expected_revisions},
-            'task': {'task_id': op.task_id, 'workspace_id': op.workspace_id,
-                     'goal': task['goal'], 'constraints': json.loads(task['constraints_json']),
+            'request': {'capability': op.capability, 'action': op.action, 'object_refs': list(op.object_refs),
+                        'arguments': op.arguments, 'expected_revisions': op.expected_revisions},
+            'task': {'task_id': op.task_id, 'workspace_id': op.workspace_id, 'goal': task['goal'],
+                     'constraints': json.loads(task['constraints_json']),
                      'success_criteria': json.loads(task['success_criteria_json']),
-                     'max_operations': budget.get('max_operations', 64),
-                     'deadline_at': budget.get('deadline_at')},
-            'action_spec': asdict(spec), 'policy': asdict(policy), 'entities': entities,
-        }
+                     'max_operations': budget.get('max_operations', 64), 'deadline_at': budget.get('deadline_at')},
+            'action_spec': asdict(spec), 'policy': asdict(policy), 'entities': entities}
 
-    def _operation(self, task_id: str, workspace_id: str, proposal: ActionProposal,
-                   expected: dict) -> Operation:
+    def _operation(self, task_id: str, workspace_id: str, proposal: ActionProposal, expected: dict) -> Operation:
         spec = self.registry.resolve(proposal)
-        return Operation(operation_id='approval-preview', task_id=task_id,
-            workspace_id=workspace_id, capability=proposal.capability, action=proposal.action,
-            object_refs=tuple(proposal.object_refs), arguments=json.loads(canonical(proposal.arguments)),
-            risk_class=spec.risk_class, required_permission=spec.required_permission,
-            idempotency_mode=spec.idempotency_mode.value, expected_revisions=dict(expected))
+        return Operation(operation_id='approval-preview', task_id=task_id, workspace_id=workspace_id,
+            capability=proposal.capability, action=proposal.action, object_refs=tuple(proposal.object_refs),
+            arguments=json.loads(canonical(proposal.arguments)), risk_class=spec.risk_class,
+            required_permission=spec.required_permission, idempotency_mode=spec.idempotency_mode.value,
+            expected_revisions=dict(expected))
 
     def _fresh(self, row: Any, op: Operation | None = None) -> None:
         if row['expires_at'] <= now():
@@ -158,10 +140,10 @@ class ApprovalService:
         if not hmac.compare_digest(digest(saved), row['request_digest']):
             raise ApprovalError('stored approval digest mismatch')
         if op is None:
-            request = saved['request']
-            proposal = ActionProposal(row['proposal_id'], request['capability'], request['action'],
-                                      tuple(request['object_refs']), request['arguments'])
-            op = self._operation(row['task_id'], row['workspace_id'], proposal, request['expected_revisions'])
+            req = saved['request']
+            proposal = ActionProposal(row['proposal_id'], req['capability'], req['action'],
+                                      tuple(req['object_refs']), req['arguments'])
+            op = self._operation(row['task_id'], row['workspace_id'], proposal, req['expected_revisions'])
         if op.task_id != row['task_id'] or op.workspace_id != row['workspace_id']:
             raise ApprovalError('approval task/workspace mismatch')
         if not hmac.compare_digest(digest(self._snapshot(op)), row['request_digest']):
@@ -173,31 +155,32 @@ class ApprovalService:
             if task_lease is not None:
                 if task_lease.task_id != task.task_id:
                     raise ApprovalError('lease task mismatch')
-                _lease(self.store.conn, 'task_leases', task.task_id,
-                       task_lease.owner_id, task_lease.generation)
+                _lease(self.store.conn, 'task_leases', task.task_id, task_lease.owner_id, task_lease.generation)
             if unsettled_rows(self.store, task.task_id):
                 raise ApprovalError('unresolved operation prevents a new approval')
             snapshot = self._snapshot(preview)
+            snapshot_json = canonical(snapshot)
+            if len(snapshot_json.encode('utf-8')) > 262144:
+                raise ApprovalError('approval snapshot exceeds 256 KiB; use a reviewed artifact reference')
             request_digest = digest(snapshot)
-            old = self.store.conn.execute('''SELECT * FROM approval_requests
-                WHERE task_id=? AND proposal_id=?''', (task.task_id, proposal.proposal_id)).fetchone()
+            old = self.store.conn.execute('SELECT * FROM approval_requests WHERE task_id=? AND proposal_id=?',
+                                          (task.task_id, proposal.proposal_id)).fetchone()
             if old:
                 if old['request_digest'] != request_digest:
                     raise ApprovalError('proposal ID reused with a different request')
+                if old['state'] not in {'PENDING', 'APPROVED'}:
+                    raise ApprovalError('proposal was already decided or consumed; do not reuse its ID')
+                self._fresh(old)
                 return old['approval_id']
-            existing = self.outstanding(task.task_id)
-            if existing is not None:
-                raise ApprovalError('resolve the outstanding approval first')
-            approval_id = new_id('approval')
-            ts = now()
+            if self.outstanding(task.task_id) is not None:
+                raise ApprovalError('resolve or revoke the outstanding approval first')
+            approval_id, ts = new_id('approval'), now()
             self.store.conn.execute('''INSERT INTO approval_requests
-                (approval_id,task_id,workspace_id,proposal_id,snapshot_json,request_digest,
-                 state,created_at,expires_at) VALUES(?,?,?,?,?,?,'PENDING',?,?)''',
-                (approval_id, task.task_id, task.workspace_id, proposal.proposal_id,
-                 canonical(snapshot), request_digest, ts, ts + self.ttl_seconds))
-            self.store.conn.execute('''UPDATE tasks SET state=?, wait_reason=?,
-                phase=?, revision=revision+1 WHERE task_id=?''',
-                ('WAITING', f'approval:{approval_id}', 'AUTHORIZING', task.task_id))
+                (approval_id,task_id,workspace_id,proposal_id,snapshot_json,request_digest,state,created_at,expires_at)
+                VALUES(?,?,?,?,?,?,'PENDING',?,?)''', (approval_id, task.task_id, task.workspace_id,
+                proposal.proposal_id, snapshot_json, request_digest, ts, ts + self.ttl_seconds))
+            self.store.conn.execute('UPDATE tasks SET state=?,wait_reason=?,phase=?,revision=revision+1 WHERE task_id=?',
+                                   ('WAITING', f'approval:{approval_id}', 'AUTHORIZING', task.task_id))
             self._event(self._row(approval_id), 'approval.requested', 'policy')
         copy_record(task, self.store.load_tasks()[task.task_id])
         return approval_id
@@ -224,16 +207,13 @@ class ApprovalService:
                     return self.inspect(approval_id, workspace_id=workspace_id)
                 raise ApprovalError('approval is not pending')
             self._fresh(row)
-            self.store.conn.execute('''UPDATE approval_requests SET state=?,decided_at=?,decided_by=?
-                WHERE approval_id=? AND state='PENDING' ''', (desired, now(), principal_id, approval_id))
-            # Human control invalidates the old waiting worker. No fresh model call is needed.
+            self.store.conn.execute("UPDATE approval_requests SET state=?,decided_at=?,decided_by=? WHERE approval_id=? AND state='PENDING'",
+                                    (desired, now(), principal_id, approval_id))
             self.store.conn.execute('UPDATE task_leases SET lease_until=0 WHERE task_id=?', (row['task_id'],))
             self.store.conn.execute('''UPDATE tasks SET state=?,desired_state=?,wait_reason=?,
-                queued_at=?,revision=revision+1 WHERE task_id=?''',
-                ('QUEUED' if approve else 'BLOCKED', 'RUNNING',
-                 f'approval:{approval_id}' if approve else 'approval:denied', now(), row['task_id']))
-            self._event(row, 'approval.approved' if approve else 'approval.denied', 'user',
-                        principal_id=principal_id)
+                queued_at=?,revision=revision+1 WHERE task_id=?''', ('QUEUED' if approve else 'BLOCKED',
+                'RUNNING', f'approval:{approval_id}' if approve else 'approval:denied', now(), row['task_id']))
+            self._event(row, 'approval.approved' if approve else 'approval.denied', 'user', principal_id=principal_id)
         return self.inspect(approval_id, workspace_id=workspace_id)
 
     def revoke(self, approval_id: str, *, principal_id: str, workspace_id: str, request_digest: str) -> dict:
@@ -250,6 +230,10 @@ class ApprovalService:
             if linked is not None and linked['state'] != 'PREPARED':
                 raise ApprovalError('operation was dispatched; revocation cannot undo a side effect')
             self.store.conn.execute("UPDATE approval_requests SET state='REVOKED' WHERE approval_id=?", (approval_id,))
+            # Revocation must stop scheduling too, not silently trigger another model proposal.
+            self.store.conn.execute("""UPDATE tasks SET state='BLOCKED',wait_reason='approval:revoked',
+                revision=revision+1 WHERE task_id=? AND state NOT IN ('COMPLETED','FAILED','CANCELLED')
+                AND desired_state NOT IN ('PAUSED','CANCELLED')""", (row['task_id'],))
             self._event(row, 'approval.revoked', 'user', principal_id=principal_id)
         return self.inspect(approval_id, workspace_id=workspace_id)
 
@@ -258,13 +242,12 @@ class ApprovalService:
         if row['state'] != 'APPROVED':
             raise ApprovalError('approval is not approved')
         self._fresh(row)
-        request = json.loads(row['snapshot_json'])['request']
-        return (ActionProposal(row['proposal_id'], request['capability'], request['action'],
-                               tuple(request['object_refs']), request['arguments']),
-                request['expected_revisions'])
+        req = json.loads(row['snapshot_json'])['request']
+        return (ActionProposal(row['proposal_id'], req['capability'], req['action'],
+                               tuple(req['object_refs']), req['arguments']), req['expected_revisions'])
 
     def bind_in_transaction(self, op: Operation, approval_id: str | None) -> None:
-        """Called AFTER operation insert but BEFORE the same reservation transaction commits."""
+        """After operation INSERT, before that SAME reservation transaction commits."""
         if not self.store.conn.in_transaction:
             raise ApprovalError('approval binding requires the operation transaction')
         decision = self.policy.evaluate(op.workspace_id, op.capability, op.action, op.risk_class)
@@ -278,18 +261,15 @@ class ApprovalService:
         if row['state'] != 'APPROVED':
             raise ApprovalError('approval was consumed, rejected or never approved')
         self._fresh(row, op)
-        self.store.conn.execute('''INSERT INTO approval_operations
-            (operation_id,approval_id,request_digest) VALUES(?,?,?)''',
-            (op.operation_id, approval_id, row['request_digest']))
+        self.store.conn.execute('INSERT INTO approval_operations(operation_id,approval_id,request_digest) VALUES(?,?,?)',
+                               (op.operation_id, approval_id, row['request_digest']))
         self.store.conn.execute("UPDATE approval_requests SET state='CONSUMED' WHERE approval_id=?", (approval_id,))
         self._event(row, 'approval.consumed', 'engine', operation_id=op.operation_id)
 
     def check_dispatch_in_transaction(self, op: Operation) -> None:
-        link = self.store.conn.execute('SELECT * FROM approval_operations WHERE operation_id=?',
-                                       (op.operation_id,)).fetchone()
+        link = self.store.conn.execute('SELECT * FROM approval_operations WHERE operation_id=?', (op.operation_id,)).fetchone()
         if link is None:
-            if self.policy.evaluate(op.workspace_id, op.capability, op.action,
-                                    op.risk_class) is not PolicyDecision.ALLOW:
+            if self.policy.evaluate(op.workspace_id, op.capability, op.action, op.risk_class) is not PolicyDecision.ALLOW:
                 raise ApprovalError('unapproved or newly forbidden dispatch')
             return
         row = self._row(link['approval_id'])

@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Build and re-open a verified Native Core source snapshot after verification.
-
-Only tracked repository files and explicitly generated test reports are included.
-There is no upload, credential access, deployment or model invocation here.
-"""
+"""Pack only tracked sources and generated evidence; verify unpacked imports/tests."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -41,8 +37,9 @@ def main():
     evidence = ROOT / 'verification'
     report = json.loads((evidence / 'verification.json').read_text(encoding='utf-8'))
     smoke = json.loads((evidence / 'smoke.json').read_text(encoding='utf-8'))
-    if not report.get('all_passed') or not smoke.get('all_passed'):
-        raise RuntimeError('refusing to package a failed or incomplete verification')
+    approval = json.loads((evidence / 'approval_smoke.json').read_text(encoding='utf-8'))
+    if not all(r.get('all_passed') for r in (report, smoke, approval)):
+        raise RuntimeError('refusing to package failed or incomplete verification')
     version = tomllib.loads((ROOT / 'pyproject.toml').read_text(encoding='utf-8'))['project']['version']
     commit = git('rev-parse', 'HEAD').decode().strip()
     tracked = [name for name in git('ls-files', '-z').decode().split('\0') if name]
@@ -53,12 +50,12 @@ def main():
             payload[relative] = safe_file(relative).read_bytes()
     meta = {'project': 'Liandanlu Native Companion Core', 'version': version,
             'source_commit': commit, 'created_at': datetime.now(timezone.utc).isoformat(),
-            'scope': 'Complete tracked Native Core repository, not the original full frontend/video application',
+            'scope': 'Complete tracked Native Core repository; not the original frontend/video application',
             'ci_run_id': os.getenv('GITHUB_RUN_ID'), 'source_files': len(tracked),
-            'api_calls_in_smoke': 0}
+            'model_in_smoke': 'scripted_offline', 'api_calls_in_smoke': 0}
     payload['PACKAGE_META.json'] = (json.dumps(meta, ensure_ascii=False, indent=2) + '\n').encode()
     hashes = {name: hashlib.sha256(content).hexdigest() for name, content in sorted(payload.items())}
-    payload['MANIFEST.sha256'] = ''.join(f'{digest}  {name}\n' for name, digest in hashes.items()).encode()
+    payload['MANIFEST.sha256'] = ''.join(f'{value}  {name}\n' for name, value in hashes.items()).encode()
     out = ROOT / 'dist'
     out.mkdir(exist_ok=True)
     folder = f'Liandanlu_Native_Core_{version}'
@@ -69,31 +66,42 @@ def main():
     with zipfile.ZipFile(destination) as archive:
         if archive.testzip() is not None:
             raise RuntimeError('ZIP CRC check failed')
-        for name, digest in hashes.items():
-            if hashlib.sha256(archive.read(f'{folder}/{name}')).hexdigest() != digest:
+        for name, value in hashes.items():
+            if hashlib.sha256(archive.read(f'{folder}/{name}')).hexdigest() != value:
                 raise RuntimeError(f'archive hash mismatch: {name}')
         with tempfile.TemporaryDirectory(prefix='liandanlu-package-check-') as tmp:
             archive.extractall(tmp)
             unpacked = Path(tmp) / folder
-            command = [sys.executable, str(unpacked / 'scripts' / 'companion_smoke.py')]
-            result = subprocess.run(command, cwd=unpacked, capture_output=True, text=True, timeout=120)
-            if result.returncode != 0:
-                raise RuntimeError(f'unpacked source failed smoke: {result.stdout}\n{result.stderr}')
-            unpacked_smoke = json.loads(result.stdout)
-            if not unpacked_smoke['all_passed']:
-                raise RuntimeError('unpacked source smoke incomplete')
-    junit = ET.parse(evidence / 'junit.xml')
-    suites = list(junit.iter('testsuite'))
+            env = os.environ.copy()
+            env['PYTHONPATH'] = str(unpacked)
+            env['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
+            check_import = subprocess.run([sys.executable, '-c',
+                'import pathlib,liandanlu_native; assert pathlib.Path(liandanlu_native.__file__).resolve().is_relative_to(pathlib.Path.cwd())'],
+                cwd=unpacked, env=env, capture_output=True, text=True, timeout=15)
+            if check_import.returncode:
+                raise RuntimeError('unpacked package import resolved outside the archive')
+            for script in ('companion_smoke.py', 'approval_smoke.py'):
+                result = subprocess.run([sys.executable, str(unpacked / 'scripts' / script)],
+                    cwd=unpacked, env=env, capture_output=True, text=True, timeout=120)
+                if result.returncode != 0 or not json.loads(result.stdout).get('all_passed'):
+                    raise RuntimeError(f'unpacked {script} failed: {result.stdout}\n{result.stderr}')
+            regression = subprocess.run([sys.executable, '-m', 'pytest', '-q', '-W', 'error'],
+                cwd=unpacked, env=env, capture_output=True, text=True, timeout=180)
+            if regression.returncode:
+                raise RuntimeError(f'unpacked full regression failed: {regression.stdout}\n{regression.stderr}')
+    suites = list(ET.parse(evidence / 'junit.xml').iter('testsuite'))
     coverage = json.loads((evidence / 'coverage.json').read_text(encoding='utf-8'))
     summary = {**meta, 'archive': destination.name,
-               'sha256': hashlib.sha256(destination.read_bytes()).hexdigest(),
-               'bytes': destination.stat().st_size, 'manifest_files_checked': len(hashes),
-               'zip_crc_valid': True, 'unpacked_smoke_passed': True,
-               'tests': sum(int(item.get('tests', 0)) for item in suites),
-               'failures': sum(int(item.get('failures', 0)) + int(item.get('errors', 0)) for item in suites),
-               'skipped': sum(int(item.get('skipped', 0)) for item in suites),
-               'statement_coverage_percent': coverage['totals']['percent_covered'],
-               'crash_cases': smoke['cases']}
+        'sha256': hashlib.sha256(destination.read_bytes()).hexdigest(),
+        'bytes': destination.stat().st_size, 'manifest_files_checked': len(hashes),
+        'zip_crc_valid': True, 'unpacked_import_verified': True,
+        'unpacked_smoke_passed': True, 'unpacked_approval_smoke_passed': True,
+        'unpacked_full_regression_passed': True,
+        'tests': sum(int(item.get('tests', 0)) for item in suites),
+        'failures': sum(int(item.get('failures', 0)) + int(item.get('errors', 0)) for item in suites),
+        'skipped': sum(int(item.get('skipped', 0)) for item in suites),
+        'statement_coverage_percent': coverage['totals']['percent_covered'],
+        'crash_cases': smoke['cases'], 'approval_cases': approval['cases']}
     (out / 'PACKAGE_REPORT.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     (out / f'{destination.name}.sha256').write_text(f'{summary["sha256"]}  {destination.name}\n', encoding='utf-8')
     print(json.dumps(summary, ensure_ascii=False, indent=2))

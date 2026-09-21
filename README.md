@@ -1,44 +1,36 @@
-# 炼丹炉 Native Companion Core — 0.5.0a9 Recovery Integrity
+# 炼丹炉 Native Companion Core — 0.5.0a10
 
-本包是炼丹炉原生后端内核仓库的完整源码快照，不是旧前端、影视后端、模型权重和用户素材的整合安装包。它在 a8 Desktop Bridge Protocol 上加固任务执行与恢复；未改用 LangGraph 或 Temporal。
+本版本补齐后端的“请求确认 → 人工批准 → 恢复原动作 → 执行与验证”链路。
+基于 a9 的 `312ff122d4da841fe861bb44160f80e9b468e2ff`，不包含旧前端和视频应用的整合。
 
-## 立即验证
+## 已实现的内核能力
 
-Python 3.11 或更新版本，无需模型 API、无需下载大模型：
+审批请求以 SQLite 持久保存，记录具体 Task、Workspace、参数、对象引用、对象指纹、任务约束、ActionSpec、Policy 和有效期。人工决定必须携带被展示请求的摘要；模型接口不提供批准方法。批准后恢复保存的原提案，不再次调用模型选择新动作。
+
+审批消耗、操作创建、预算扣减和 Outbox 在同一个短事务内提交。执行前再次验证审批、策略、对象和有效期。重复批准不重复排队；审批不能授权第二个操作。撤销阻断尚未派发的操作，不声称撤回已经发生的副作用。未知结果继续走 a9 的保守恢复，不使用批准票据重新执行。
+
+## 运行验证
+
+Python 3.11 或更新版本，在源码目录运行：
 
 ```bash
-python3 scripts/companion_smoke.py
+python3 scripts/approval_smoke.py
 ```
 
-这会在临时目录运行五个真实子进程崩溃场景：准备后退出、派发后副作用前退出、文件写入后回执前退出、结果落库后验证前退出、验证后事件分发前退出。输出包含实际退出码、恢复状态、副作用次数、原文件校验和 SQLite 完整性。
+只操作临时目录，使用明确标注的脚本模型，不调用 API、不读取私人目录。该脚本以真实子进程退出测试请求持久化、批准后重启、写入后进程死亡，以及准备后进程死亡。
 
-完整分组测试（创建本目录 .venv，仅安装测试依赖）：
+完整分组测试：
 
 ```bash
 bash verify.command
 ```
 
-结果存于 `verification/verification.json`；每组独立超时和日志，结果区分 PASS / TEST_FAILURE / TIMEOUT / INFRASTRUCTURE_ERROR。
+源码包由 CI 验证成功后生成，包含校验清单和验证报告。打包器重新解压、验证导入来自解压目录，并重新运行两组 smoke 和完整测试集。精确测试数量和覆盖率以当前运行报告为准。
 
-## 本轮实现
+## 人工审批的真实边界
 
-- `integrity.py`：短 SQLite BEGIN IMMEDIATE 事务；数据库内读取预算、扣减预算、保存操作和 Outbox；原子 PREPARED → RUNNING 竞争；操作不可变参数检查；持久结果的比较后更新。
-- `owned_state.py`：Worker 写任务状态时重新核对租约，不能覆盖新 Worker 或用户已提交的暂停/取消。
-- `runtime.py`：同一 Operation 不得二次派发；未知结果保持 UNKNOWN；reconcile 返回已执行仍要跑 Verifier；缺失 Provider 不终止其他恢复。
-- `resources.py`：未解决操作绑定的资源额度不会因 TTL 到期或 Worker finally 退出而被重新分配；核对完成后才能释放。
-- `agent.py`：模型调用前、返回后和状态写入时检查所有权；校验 Task 与 ContextManifest 的对应关系。
-- `recovery.py`：逐操作隔离错误，返回 ready/degraded；有未核实操作时不假报取消完成。
+`ApprovalService(..., human_principals=frozenset({...}))` 由可信 Host 配置。Host 必须先认证用户，再调用 `decide` / `revoke`，并绑定展示内容的 `request_digest`。默认服务不接受任何人工身份。这里还没有前端审批卡、登录验证或实时语音的身份认证，不能把 Python 里的身份字符串称为完整认证系统。批准也不等于任务完成：本轮仍使用现有适配器 Verifier。
 
-## 保留的 a8 能力
+尚未完成：完整 Evidence Registry、原前端整合、真实 Swift/Finder/Accessibility 操作、云 LLM 与网站/电商/视频 Provider、MaleCNS 神经仿真、24 小时稳定性验收。操作次数预算不是美元费用预算。
 
-Engine 侧 Unix Socket 客户端、长度帧、协议与能力握手、同用户 peer 校验、Bridge generation 和响应关联检查继续保留。World/ObjectRef、任务租约、记忆、事件消费游标仍使用同一 SQLite 存储。
-
-## 验证边界
-
-CI 包含 Linux Python 3.11/3.12/3.13 与 macOS Python 3.13。测试覆盖率描述执行过的语句比例，不代表产品完成度或无漏洞证明。包内 PACKAGE_META.json、MANIFEST.sha256 和 verification/ 给出本次构建的实际证据。
-
-真实 macOS Finder/Accessibility/音乐控制、实时语音、真实云 LLM、网站/电商/视频 Provider、MaleCNS 神经仿真仍未作为本轮完成项。内置测试模型是明确标记的 fixture，不冒充真实大模型。
-
-特别注意：本地原子派发不是任意第三方系统的 exactly-once；外部执行端仍需支持 fencing、幂等键或可查询回执。ResourceBroker 是额度准入，不是操作系统内存硬限制。UNKNOWN 保守等待需要后续 Provider 回执或人工核对，而不是无限自动重试。
-
-详见 [本轮审计与来源](docs/A9_INTEGRITY_AUDIT.md)。
+详见 `docs/A10_APPROVAL_AUDIT.md`。主分支和旧工程不自动覆盖。
