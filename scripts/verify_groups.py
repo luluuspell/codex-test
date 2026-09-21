@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded, logged source-tree verification; failure is never reported as success."""
+"""Bounded, logged source-tree verification; failures never become success."""
 from __future__ import annotations
 
 import argparse
@@ -34,7 +34,6 @@ def stop_group(proc: subprocess.Popen) -> None:
         else:
             proc.kill()
         proc.wait(timeout=2)
-    # Also clean children which outlived an already exited group leader.
     if os.name == 'posix':
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -46,15 +45,11 @@ def run_check(name: str, command: list[str], timeout: float, directory: Path) ->
     directory.mkdir(parents=True, exist_ok=True)
     started = datetime.now(timezone.utc).isoformat()
     timer = time.monotonic()
-    stdout = directory / f'{name}.stdout.log'
-    stderr = directory / f'{name}.stderr.log'
-    proc = None
+    stdout, stderr = directory / f'{name}.stdout.log', directory / f'{name}.stderr.log'
+    proc, code, error = None, None, None
     status = 'INFRASTRUCTURE_ERROR'
-    error = None
-    code = None
     env = os.environ.copy()
     env['PYTHONUNBUFFERED'] = '1'
-    # Disable unrelated auto-loaded pytest plugins in an existing user Python install.
     env['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
     try:
         with stdout.open('wb') as out, stderr.open('wb') as err:
@@ -71,8 +66,8 @@ def run_check(name: str, command: list[str], timeout: float, directory: Path) ->
         error = f'{type(exc).__name__}: {exc}'
         if proc is not None:
             stop_group(proc)
-    result = {'check': name, 'command': command, 'status': status,
-              'started_at': started, 'finished_at': datetime.now(timezone.utc).isoformat(),
+    result = {'check': name, 'command': command, 'status': status, 'started_at': started,
+              'finished_at': datetime.now(timezone.utc).isoformat(),
               'duration_seconds': round(time.monotonic() - timer, 3), 'exit_code': code,
               'stdout_file': stdout.name, 'stderr_file': stderr.name, 'error': error}
     (directory / f'{name}.json').write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
@@ -83,8 +78,7 @@ def run_check(name: str, command: list[str], timeout: float, directory: Path) ->
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', type=Path, default=ROOT / 'verification')
-    args = parser.parse_args()
-    output = args.output.resolve()
+    output = parser.parse_args().output.resolve()
     py = sys.executable
     pytest = [py, '-m', 'pytest', '-p', 'pytest_cov.plugin', '-q', '-W', 'error']
     groups = [
@@ -96,11 +90,12 @@ def main() -> None:
              'tests/test_execution_fencing_resources.py', 'tests/test_recovery_integrity.py'], 45),
         ('40_bridge', pytest + ['tests/test_desktop_bridge_protocol.py'], 40),
         ('50_faults', pytest + ['tests/test_integrity_faults.py'], 90),
+        ('55_approvals', pytest + ['tests/test_durable_approvals.py', 'tests/test_approval_lifecycle.py'], 100),
         ('60_regression', pytest + ['--cov=liandanlu_native', '--cov-report=term-missing',
              f'--cov-report=json:{output / "coverage.json"}', '--cov-fail-under=75',
-             f'--junitxml={output / "junit.xml"}'], 120),
-        ('70_real_crash_smoke', [py, 'scripts/companion_smoke.py',
-             '--report', str(output / 'smoke.json')], 110),
+             f'--junitxml={output / "junit.xml"}'], 150),
+        ('70_real_crash_smoke', [py, 'scripts/companion_smoke.py', '--report', str(output / 'smoke.json')], 110),
+        ('80_approval_restart_smoke', [py, 'scripts/approval_smoke.py', '--report', str(output / 'approval_smoke.json')], 110),
     ]
     checks = []
     for name, command, timeout in groups:
@@ -109,8 +104,7 @@ def main() -> None:
         if result['status'] != 'PASS':
             break
     report = {'all_passed': len(checks) == len(groups) and all(x['status'] == 'PASS' for x in checks),
-              'python': sys.version, 'checks': checks,
-              'not_run': [item[0] for item in groups[len(checks):]]}
+              'python': sys.version, 'checks': checks, 'not_run': [item[0] for item in groups[len(checks):]]}
     (output / 'verification.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     raise SystemExit(0 if report['all_passed'] else 1)
 
