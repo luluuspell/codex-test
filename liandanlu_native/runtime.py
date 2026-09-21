@@ -7,8 +7,8 @@ from typing import Protocol, Any
 from .capabilities import CapabilityRegistry
 from .events import EventStore
 from .models import (
-    ActionProposal, GoalClaim, Operation, OperationState, Task, TaskBudget,
-    TaskLease, TaskPhase, TaskState, new_id, now,
+    ActionProposal, GoalClaim, Operation, OperationState, ResourceLease, Task,
+    TaskBudget, TaskLease, TaskPhase, TaskState, new_id, now,
 )
 from .world import WorldModel
 
@@ -34,12 +34,24 @@ class RuntimePersistence(Protocol):
         self, lease: TaskLease, *, lease_seconds: float, now_ts: float | None = None
     ) -> TaskLease | None: ...
     def release_task_lease(self, lease: TaskLease) -> bool: ...
+    def validate_task_lease_identity(
+        self, task_id: str, owner_id: str, generation: int,
+        *, now_ts: float | None = None
+    ) -> bool: ...
+    def validate_resource_lease_identity(
+        self, task_id: str, owner_id: str, generation: int,
+        *, now_ts: float | None = None
+    ) -> bool: ...
 
 
 class BudgetExceeded(RuntimeError):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+class LeaseLost(RuntimeError):
+    pass
 
 
 @dataclass
@@ -193,7 +205,15 @@ class OperationRuntime:
                 payload=payload or {},
             )
 
-    def prepare(self, task: Task, proposal: ActionProposal, *, expected_revisions: dict[str, int]) -> Operation:
+    def prepare(
+        self,
+        task: Task,
+        proposal: ActionProposal,
+        *,
+        expected_revisions: dict[str, int],
+        task_lease: TaskLease | None = None,
+        resource_lease: ResourceLease | None = None,
+    ) -> Operation:
         spec = self.registry.resolve(proposal)
         self.world.assert_revisions(
             expected_revisions, workspace_id=task.workspace_id
@@ -202,6 +222,20 @@ class OperationRuntime:
             self.world.assert_access(
                 ref, spec.required_permission, workspace_id=task.workspace_id
             )
+        if task_lease is not None:
+            if task_lease.task_id != task.task_id:
+                raise LeaseLost("task lease belongs to another task")
+            if self.persistence is not None and not self.persistence.validate_task_lease_identity(
+                task.task_id, task_lease.owner_id, task_lease.generation
+            ):
+                raise LeaseLost("task lease is stale or expired")
+        if resource_lease is not None:
+            if resource_lease.task_id != task.task_id:
+                raise LeaseLost("resource lease belongs to another task")
+            if self.persistence is not None and not self.persistence.validate_resource_lease_identity(
+                task.task_id, resource_lease.owner_id, resource_lease.generation
+            ):
+                raise LeaseLost("resource lease is stale or expired")
         op = Operation(
             operation_id=new_id("op"), task_id=task.task_id,
             workspace_id=task.workspace_id,
@@ -212,6 +246,10 @@ class OperationRuntime:
             idempotency_mode=spec.idempotency_mode.value,
             state=OperationState.PREPARED,
             expected_revisions=dict(expected_revisions),
+            task_lease_owner_id=task_lease.owner_id if task_lease else None,
+            task_lease_generation=task_lease.generation if task_lease else None,
+            resource_lease_owner_id=resource_lease.owner_id if resource_lease else None,
+            resource_lease_generation=resource_lease.generation if resource_lease else None,
         )
         reason = task.budget.block_reason(now())
         if reason is not None:
@@ -268,6 +306,16 @@ class OperationRuntime:
         return op
 
     def execute(self, op: Operation) -> Operation:
+        if self.persistence is not None and op.task_lease_owner_id is not None:
+            if not self.persistence.validate_task_lease_identity(
+                op.task_id, op.task_lease_owner_id, int(op.task_lease_generation)
+            ):
+                raise LeaseLost("task lease was lost before side effect execution")
+        if self.persistence is not None and op.resource_lease_owner_id is not None:
+            if not self.persistence.validate_resource_lease_identity(
+                op.task_id, op.resource_lease_owner_id, int(op.resource_lease_generation)
+            ):
+                raise LeaseLost("resource lease was lost before side effect execution")
         capability = self.capabilities[op.capability]
         self.world.assert_revisions(
             op.expected_revisions, workspace_id=op.workspace_id

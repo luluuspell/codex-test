@@ -100,6 +100,47 @@ class TaskLease:
     lease_until: float
 
 
+@dataclass(frozen=True, slots=True)
+class ResourceRequest:
+    cpu_units: int = 0
+    memory_mb: int = 0
+    gpu_units: int = 0
+    exclusive_labels: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.cpu_units < 0 or self.memory_mb < 0 or self.gpu_units < 0:
+            raise ValueError("resource requests cannot be negative")
+
+    def empty(self) -> bool:
+        return (
+            self.cpu_units == 0
+            and self.memory_mb == 0
+            and self.gpu_units == 0
+            and not self.exclusive_labels
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceCapacity:
+    cpu_units: int
+    memory_mb: int
+    gpu_units: int
+
+    def __post_init__(self) -> None:
+        if self.cpu_units < 0 or self.memory_mb < 0 or self.gpu_units < 0:
+            raise ValueError("resource capacity cannot be negative")
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceLease:
+    task_id: str
+    owner_id: str
+    generation: int
+    request: ResourceRequest
+    claimed_at: float
+    lease_until: float
+
+
 @dataclass(slots=True)
 class Entity:
     entity_id: str
@@ -147,6 +188,10 @@ class Operation:
     evidence: list[dict[str, Any]] = field(default_factory=list)
     result: dict[str, Any] | None = None
     error: str | None = None
+    task_lease_owner_id: str | None = None
+    task_lease_generation: int | None = None
+    resource_lease_owner_id: str | None = None
+    resource_lease_generation: int | None = None
 
 
 @dataclass(slots=True)
