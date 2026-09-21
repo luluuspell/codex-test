@@ -21,6 +21,22 @@ private func unixMillis() -> Int64 {
     Int64(Date().timeIntervalSince1970 * 1000.0)
 }
 
+private func disableSigPipe(_ fd: Int32) throws {
+    var enabled: Int32 = 1
+    let result = withUnsafePointer(to: &enabled) { pointer in
+        Darwin.setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            pointer,
+            socklen_t(MemoryLayout<Int32>.size)
+        )
+    }
+    guard result == 0 else {
+        throw BridgeFailure.message("setsockopt(SO_NOSIGPIPE) failed errno=\(errno)")
+    }
+}
+
 private func readExact(_ fd: Int32, count: Int) throws -> Data {
     var output = Data()
     output.reserveCapacity(count)
@@ -254,13 +270,17 @@ private final class BridgeServer {
             autoreleasepool {
                 defer { Darwin.close(clientFD) }
                 do {
+                    try disableSigPipe(clientFD)
                     try handleClient(clientFD)
                 } catch {
-                    sendError(
-                        clientFD,
-                        code: "protocol_error",
-                        message: String(describing: error)
-                    )
+                    let message = String(describing: error)
+                    if message != "peer closed connection" {
+                        sendError(
+                            clientFD,
+                            code: "protocol_error",
+                            message: message
+                        )
+                    }
                 }
             }
         }
