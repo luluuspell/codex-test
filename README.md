@@ -1,38 +1,36 @@
-# Liandanlu Native Companion Core — 0.5.0a7 Execution Fencing & Resource Admission
+# Liandanlu Native Companion Core — 0.5.0a8 Desktop Bridge Protocol
 
-0.5.0a7 closes the gap between durable task claiming and actual side-effect execution.
+0.5.0a8 begins the native macOS execution boundary. This slice defines and verifies the Engine-side Unix-domain-socket protocol; it does not yet claim Finder/Accessibility write actions are implemented.
 
-## Runtime guarantees added
+## Desktop Bridge protocol guarantees
 
-- Persistent Agent execution requires a valid Task lease by default; direct no-lease execution must be explicitly opted into for isolated tests/tools.
-- Task lease generation is now carried into Operation records.
-- A worker that loses its task lease after preparing an operation is fenced before any real side effect can execute.
-- ActionSpec now owns an authoritative ResourceRequest in addition to risk, permission, revision and idempotency contracts.
-- ResourceBroker performs bounded CPU / memory / GPU admission and exclusive-label arbitration.
-- Resource leases are durable, generation-fenced, renewable and releasable.
-- Lease release preserves the durable fence generation, preventing ABA generation reuse after release/reacquire.
-- An active resource lease cannot be stolen by a second owner for the same task.
-- Operation execution revalidates both task and resource lease generations immediately before the capability side effect.
-- A resource-starved task enters WAITING without consuming operation budget or creating an Operation.
-- Successful synchronous actions release resource leases after verification.
-- Memory event processing now begins with a SQLite IMMEDIATE transaction so concurrent consumers cannot create duplicate revisions for one event.
-- Operation persistence records task/resource fence generations for audit and restart diagnostics.
+- local AF_UNIX transport, not an exposed localhost HTTP control port;
+- four-byte big-endian length framing + UTF-8 JSON object payloads;
+- hard maximum frame size before body allocation;
+- protocol-version handshake with engine instance, session token, Bridge instance and generation;
+- same-user peer credential verification by default (Linux SO_PEERCRED; macOS getpeereid via libc fallback);
+- strict capability manifest: available / permission_required / unavailable;
+- model-facing code cannot send natural-language method names or arbitrary method strings;
+- request/operation correlation IDs are verified on every response;
+- Bridge generation is fenced so replies from an older restarted Bridge are rejected;
+- unknown results remain UNKNOWN for Operation reconciliation rather than being treated as success;
+- permission-required capabilities fail before an operation request is sent;
+- stale-socket health uses a real connection probe rather than filesystem existence;
+- stale cleanup refuses to unlink regular files.
 
-## Existing guarantees retained
+## Existing runtime guarantees retained
 
-- workspace-scoped World revisions and ObjectRef access;
-- durable Task / Operation / EventLog / Memory state;
-- replay-safe memory consumer receipts;
-- durable task lease claim/renew/release;
-- bounded operation/deadline budgets;
-- default-deny policy and confirmation for risky actions;
+- durable World / Task / Operation / EventLog / Memory state;
+- workspace-scoped ObjectRef access;
+- task-lease execution fencing and ABA-safe generations;
+- bounded CPU / memory / GPU resource admission;
+- bounded task operation/deadline budgets;
+- default-deny policy;
 - UNKNOWN -> reconcile recovery;
-- truthful PAUSING / CANCELLING task control;
-- evidence-backed task completion;
-- subprocess-aware RuntimeSupervisor.
+- evidence-backed task completion.
 
 ## Verification boundary
 
 CI compiles and tests clean checkouts on Linux Python 3.11/3.12/3.13 and macOS Python 3.13, treats Python warnings as errors, and enforces coverage.
 
-This is still Native Core. It does not claim real Desktop Bridge/macOS Accessibility actions, realtime voice, WEB/COMMERCE/VIDEO providers or MaleCNS neural computation are product-complete.
+This slice verifies the protocol/client contract and Unix-socket behavior on Linux/macOS. A real Swift Desktop Bridge process, Finder actions, Accessibility, screen capture and media control remain separate target-platform implementation work.
