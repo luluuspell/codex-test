@@ -7,6 +7,7 @@ import pytest
 
 from liandanlu_native.approvals import ApprovalError
 from liandanlu_native.context import ReferentStack, build_manifest
+from liandanlu_native.integrity import LeaseLost
 from liandanlu_native.models import ActionProposal, TaskState
 from liandanlu_native.runtime import TaskScheduler
 from test_durable_approvals import core, request, decide, prepare
@@ -35,7 +36,16 @@ def test_revoke_stops_queue_and_replanning(tmp_path, approved):
         c[2].refresh(task.task_id)
         assert task.state is TaskState.BLOCKED
         assert TaskScheduler(c[2]).claim_next('after-revoke') is None
-        c[4].step(task, build_manifest(task, c[1], ReferentStack()))
+        manifest = build_manifest(task, c[1], ReferentStack())
+        if not approved:
+            # Pending request retains its live planner lease: a different/unleased
+            # worker MUST still be rejected, even when the task is blocked.
+            with pytest.raises(LeaseLost):
+                c[4].step(task, manifest)
+            c[4].step(task, manifest, task_lease=lease)
+        else:
+            # Human decide atomically expires the old waiting lease.
+            c[4].step(task, manifest)
         assert c[7].calls == 1 and c[6].calls == 0
     finally:
         c[0].close()
@@ -50,7 +60,6 @@ def test_expired_approval_never_replans_in_agent(tmp_path):
         c[4].step(task, build_manifest(task, c[1], ReferentStack()), task_lease=lease)
         assert task.state is TaskState.BLOCKED
         assert c[7].calls == 1 and c[6].calls == 0
-        # Explicit revoke allows a later fresh reviewed request; history is retained.
         c[5].revoke(item['approval_id'], principal_id='human-owner', workspace_id='ws',
                     request_digest=item['request_digest'])
         assert c[5].outstanding(task.task_id) is None
