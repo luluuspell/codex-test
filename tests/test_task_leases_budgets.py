@@ -171,7 +171,9 @@ def test_operation_budget_is_durable_and_blocks_second_operation():
         policy = PolicyEngine({
             "ws": WorkspacePolicy(allowed_capabilities=frozenset({"files"}))
         })
-        runner = NativeAgentRunner(tasks, ops, ReadModel(), policy)
+        runner = NativeAgentRunner(
+            tasks, ops, ReadModel(), policy, require_task_lease=False
+        )
 
         runner.step(task, build_manifest(task, world, refs))
         assert task.budget.operations_started == 1
@@ -187,7 +189,8 @@ def test_operation_budget_is_durable_and_blocks_second_operation():
         restored_task = coordinator.tasks.tasks[task.task_id]
         assert restored_task.budget.operations_started == 1
         runner2 = NativeAgentRunner(
-            coordinator.tasks, coordinator.operations, ReadModel(), policy
+            coordinator.tasks, coordinator.operations, ReadModel(), policy,
+            require_task_lease=False,
         )
         runner2.step(
             restored_task,

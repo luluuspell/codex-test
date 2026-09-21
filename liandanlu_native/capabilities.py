@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from .models import ActionProposal, RiskClass
+from .models import ActionProposal, ResourceRequest, RiskClass
 
 
 class IdempotencyMode(str, Enum):
@@ -45,6 +45,7 @@ class ActionSpec:
     allowed_arguments: frozenset[str] = frozenset()
     required_arguments: frozenset[str] = frozenset()
     revision_domains: frozenset[str] = frozenset()
+    resource_request: ResourceRequest = ResourceRequest()
     idempotency_mode: IdempotencyMode = IdempotencyMode.RECONCILABLE
     forbidden_arguments: frozenset[str] = frozenset({
         "path", "file_path", "absolute_path", "locator", "filesystem_path",

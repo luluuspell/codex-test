@@ -6,8 +6,9 @@ from pathlib import Path
 from typing import Any
 
 from .models import (
-    Entity, Event, Operation, OperationState, RiskClass, Task, TaskBudget,
-    TaskLease, TaskPhase, TaskState, WorldRevisions, new_id, now,
+    Entity, Event, Operation, OperationState, ResourceCapacity, ResourceLease,
+    ResourceRequest, RiskClass, Task, TaskBudget, TaskLease, TaskPhase,
+    TaskState, WorldRevisions, new_id, now,
 )
 
 
@@ -67,7 +68,11 @@ class SQLiteStore:
                 expected_revisions_json TEXT NOT NULL,
                 evidence_json TEXT NOT NULL,
                 result_json TEXT,
-                error TEXT
+                error TEXT,
+                task_lease_owner_id TEXT,
+                task_lease_generation INTEGER,
+                resource_lease_owner_id TEXT,
+                resource_lease_generation INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS world_entities(
@@ -107,6 +112,18 @@ class SQLiteStore:
                 task_id TEXT PRIMARY KEY,
                 owner_id TEXT NOT NULL,
                 generation INTEGER NOT NULL,
+                claimed_at REAL NOT NULL,
+                lease_until REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS resource_leases(
+                task_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                cpu_units INTEGER NOT NULL,
+                memory_mb INTEGER NOT NULL,
+                gpu_units INTEGER NOT NULL,
+                exclusive_labels_json TEXT NOT NULL,
                 claimed_at REAL NOT NULL,
                 lease_until REAL NOT NULL
             );
@@ -184,6 +201,10 @@ class SQLiteStore:
         self._ensure_column("operations", "workspace_id", "TEXT NOT NULL DEFAULT 'default'")
         self._ensure_column("operations", "required_permission", "TEXT NOT NULL DEFAULT 'read'")
         self._ensure_column("operations", "idempotency_mode", "TEXT NOT NULL DEFAULT 'RECONCILABLE'")
+        self._ensure_column("operations", "task_lease_owner_id", "TEXT")
+        self._ensure_column("operations", "task_lease_generation", "INTEGER")
+        self._ensure_column("operations", "resource_lease_owner_id", "TEXT")
+        self._ensure_column("operations", "resource_lease_generation", "INTEGER")
         self._ensure_column("event_outbox", "workspace_id", "TEXT NOT NULL DEFAULT 'system'")
         self._ensure_column("events", "workspace_id", "TEXT NOT NULL DEFAULT 'system'")
         for name, ddl in (
@@ -381,8 +402,10 @@ class SQLiteStore:
             INSERT INTO operations(
                 operation_id,task_id,workspace_id,capability,action,object_refs_json,arguments_json,
                 risk_class,required_permission,idempotency_mode,state,
-                expected_revisions_json,evidence_json,result_json,error
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                expected_revisions_json,evidence_json,result_json,error,
+                task_lease_owner_id,task_lease_generation,
+                resource_lease_owner_id,resource_lease_generation
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(operation_id) DO UPDATE SET
                 workspace_id=excluded.workspace_id,
                 state=excluded.state,
@@ -391,7 +414,11 @@ class SQLiteStore:
                 expected_revisions_json=excluded.expected_revisions_json,
                 evidence_json=excluded.evidence_json,
                 result_json=excluded.result_json,
-                error=excluded.error
+                error=excluded.error,
+                task_lease_owner_id=excluded.task_lease_owner_id,
+                task_lease_generation=excluded.task_lease_generation,
+                resource_lease_owner_id=excluded.resource_lease_owner_id,
+                resource_lease_generation=excluded.resource_lease_generation
             """,
             (
                 op.operation_id, op.task_id, op.workspace_id, op.capability, op.action,
@@ -401,6 +428,10 @@ class SQLiteStore:
                 json.dumps(op.evidence),
                 json.dumps(op.result) if op.result is not None else None,
                 op.error,
+                op.task_lease_owner_id,
+                op.task_lease_generation,
+                op.resource_lease_owner_id,
+                op.resource_lease_generation,
             ),
         )
 
@@ -421,6 +452,10 @@ class SQLiteStore:
                 evidence=list(json.loads(row["evidence_json"])),
                 result=json.loads(row["result_json"]) if row["result_json"] else None,
                 error=row["error"],
+                task_lease_owner_id=row["task_lease_owner_id"],
+                task_lease_generation=row["task_lease_generation"],
+                resource_lease_owner_id=row["resource_lease_owner_id"],
+                resource_lease_generation=row["resource_lease_generation"],
             )
             result[op.operation_id] = op
         return result
@@ -698,7 +733,8 @@ class SQLiteStore:
         from .memory import MemoryKind, MemoryRecord, StrategyState
 
         consumer_id = "memory"
-        with self.conn:
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
             receipt = self.conn.execute(
                 """
                 SELECT * FROM consumer_receipts
@@ -712,7 +748,10 @@ class SQLiteStore:
                         "SELECT * FROM memory_records WHERE memory_id=?",
                         (receipt["result_ref"],),
                     ).fetchone()
-                    return self._row_to_memory(row) if row else None
+                    result = self._row_to_memory(row) if row else None
+                    self.conn.commit()
+                    return result
+                self.conn.commit()
                 return None
 
             if candidate is None:
@@ -720,6 +759,7 @@ class SQLiteStore:
                     consumer_id, event.event_id, event.sequence,
                     status="ignored", result_ref=None,
                 )
+                self.conn.commit()
                 return None
 
             previous = self.conn.execute(
@@ -765,7 +805,11 @@ class SQLiteStore:
                 consumer_id, event.event_id, event.sequence,
                 status="committed", result_ref=record.memory_id,
             )
+            self.conn.commit()
             return record
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def claim_next_task(
         self,
@@ -867,7 +911,8 @@ class SQLiteStore:
         with self.conn:
             cursor = self.conn.execute(
                 """
-                DELETE FROM task_leases
+                UPDATE task_leases
+                SET lease_until=0
                 WHERE task_id=? AND owner_id=? AND generation=?
                 """,
                 (lease.task_id, lease.owner_id, lease.generation),
@@ -884,6 +929,237 @@ class SQLiteStore:
             task_id=row["task_id"], owner_id=row["owner_id"],
             generation=row["generation"], claimed_at=row["claimed_at"],
             lease_until=row["lease_until"],
+        )
+
+
+    def validate_task_lease(
+        self,
+        lease: TaskLease,
+        *,
+        now_ts: float | None = None,
+    ) -> bool:
+        ts = now() if now_ts is None else now_ts
+        row = self.conn.execute(
+            """
+            SELECT owner_id,generation,lease_until
+            FROM task_leases WHERE task_id=?
+            """,
+            (lease.task_id,),
+        ).fetchone()
+        return bool(
+            row is not None
+            and row["owner_id"] == lease.owner_id
+            and row["generation"] == lease.generation
+            and row["lease_until"] > ts
+        )
+
+    def validate_task_lease_identity(
+        self,
+        task_id: str,
+        owner_id: str,
+        generation: int,
+        *,
+        now_ts: float | None = None,
+    ) -> bool:
+        ts = now() if now_ts is None else now_ts
+        row = self.conn.execute(
+            """
+            SELECT owner_id,generation,lease_until
+            FROM task_leases WHERE task_id=?
+            """,
+            (task_id,),
+        ).fetchone()
+        return bool(
+            row is not None
+            and row["owner_id"] == owner_id
+            and row["generation"] == generation
+            and row["lease_until"] > ts
+        )
+
+    def acquire_resource_lease(
+        self,
+        task_id: str,
+        owner_id: str,
+        request: ResourceRequest,
+        capacity: ResourceCapacity,
+        *,
+        lease_seconds: float,
+        now_ts: float | None = None,
+    ) -> ResourceLease | None:
+        if not task_id or not owner_id:
+            raise ValueError("task_id and owner_id are required")
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        if (
+            request.cpu_units > capacity.cpu_units
+            or request.memory_mb > capacity.memory_mb
+            or request.gpu_units > capacity.gpu_units
+        ):
+            return None
+        ts = now() if now_ts is None else now_ts
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            existing = self.conn.execute(
+                "SELECT * FROM resource_leases WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            if existing is not None and existing["lease_until"] > ts:
+                self.conn.commit()
+                return None
+            rows = list(self.conn.execute(
+                """
+                SELECT * FROM resource_leases
+                WHERE lease_until>? AND task_id<>?
+                """,
+                (ts, task_id),
+            ))
+            used_cpu = sum(row["cpu_units"] for row in rows)
+            used_memory = sum(row["memory_mb"] for row in rows)
+            used_gpu = sum(row["gpu_units"] for row in rows)
+            active_labels = {
+                label
+                for row in rows
+                for label in json.loads(row["exclusive_labels_json"])
+            }
+            if (
+                used_cpu + request.cpu_units > capacity.cpu_units
+                or used_memory + request.memory_mb > capacity.memory_mb
+                or used_gpu + request.gpu_units > capacity.gpu_units
+                or active_labels.intersection(request.exclusive_labels)
+            ):
+                self.conn.commit()
+                return None
+            generation = 1 if existing is None else int(existing["generation"]) + 1
+            lease = ResourceLease(
+                task_id=task_id,
+                owner_id=owner_id,
+                generation=generation,
+                request=request,
+                claimed_at=ts,
+                lease_until=ts + lease_seconds,
+            )
+            self.conn.execute(
+                """
+                INSERT INTO resource_leases(
+                    task_id,owner_id,generation,cpu_units,memory_mb,gpu_units,
+                    exclusive_labels_json,claimed_at,lease_until
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    owner_id=excluded.owner_id,
+                    generation=excluded.generation,
+                    cpu_units=excluded.cpu_units,
+                    memory_mb=excluded.memory_mb,
+                    gpu_units=excluded.gpu_units,
+                    exclusive_labels_json=excluded.exclusive_labels_json,
+                    claimed_at=excluded.claimed_at,
+                    lease_until=excluded.lease_until
+                """,
+                (
+                    lease.task_id, lease.owner_id, lease.generation,
+                    lease.request.cpu_units, lease.request.memory_mb,
+                    lease.request.gpu_units,
+                    json.dumps(lease.request.exclusive_labels),
+                    lease.claimed_at, lease.lease_until,
+                ),
+            )
+            self.conn.commit()
+            return lease
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def renew_resource_lease(
+        self,
+        lease: ResourceLease,
+        *,
+        lease_seconds: float,
+        now_ts: float | None = None,
+    ) -> ResourceLease | None:
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        ts = now() if now_ts is None else now_ts
+        renewed = ResourceLease(
+            task_id=lease.task_id,
+            owner_id=lease.owner_id,
+            generation=lease.generation,
+            request=lease.request,
+            claimed_at=lease.claimed_at,
+            lease_until=ts + lease_seconds,
+        )
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                UPDATE resource_leases
+                SET lease_until=?
+                WHERE task_id=? AND owner_id=? AND generation=? AND lease_until>?
+                """,
+                (
+                    renewed.lease_until, lease.task_id, lease.owner_id,
+                    lease.generation, ts,
+                ),
+            )
+        return renewed if cursor.rowcount == 1 else None
+
+    def release_resource_lease(self, lease: ResourceLease) -> bool:
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                UPDATE resource_leases
+                SET lease_until=0
+                WHERE task_id=? AND owner_id=? AND generation=?
+                """,
+                (lease.task_id, lease.owner_id, lease.generation),
+            )
+        return cursor.rowcount == 1
+
+    def validate_resource_lease(
+        self,
+        lease: ResourceLease,
+        *,
+        now_ts: float | None = None,
+    ) -> bool:
+        ts = now() if now_ts is None else now_ts
+        row = self.conn.execute(
+            """
+            SELECT owner_id,generation,lease_until,cpu_units,memory_mb,gpu_units,
+                   exclusive_labels_json
+            FROM resource_leases WHERE task_id=?
+            """,
+            (lease.task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        return bool(
+            row["owner_id"] == lease.owner_id
+            and row["generation"] == lease.generation
+            and row["lease_until"] > ts
+            and row["cpu_units"] == lease.request.cpu_units
+            and row["memory_mb"] == lease.request.memory_mb
+            and row["gpu_units"] == lease.request.gpu_units
+            and tuple(json.loads(row["exclusive_labels_json"])) == lease.request.exclusive_labels
+        )
+
+    def validate_resource_lease_identity(
+        self,
+        task_id: str,
+        owner_id: str,
+        generation: int,
+        *,
+        now_ts: float | None = None,
+    ) -> bool:
+        ts = now() if now_ts is None else now_ts
+        row = self.conn.execute(
+            """
+            SELECT owner_id,generation,lease_until
+            FROM resource_leases WHERE task_id=?
+            """,
+            (task_id,),
+        ).fetchone()
+        return bool(
+            row is not None
+            and row["owner_id"] == owner_id
+            and row["generation"] == generation
+            and row["lease_until"] > ts
         )
 
     def pending_outbox(self) -> list[dict[str, Any]]:
