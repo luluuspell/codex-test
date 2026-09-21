@@ -14,25 +14,18 @@ from typing import Any, Iterator
 from .models import OperationState, TaskBudget, TaskState, now
 from .world import StaleWorld
 
-
-UNSETTLED = frozenset({
-    OperationState.RUNNING, OperationState.UNKNOWN, OperationState.RECONCILING,
-    OperationState.OBSERVED, OperationState.VERIFYING,
-})
+UNSETTLED = frozenset({OperationState.RUNNING, OperationState.UNKNOWN,
+    OperationState.RECONCILING, OperationState.OBSERVED, OperationState.VERIFYING})
 TERMINAL_TASKS = frozenset({TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED})
-
 
 class LeaseLost(RuntimeError):
     pass
 
-
 class OperationConflict(RuntimeError):
     pass
 
-
 class StateConflict(RuntimeError):
     pass
-
 
 class BudgetExceeded(RuntimeError):
     def __init__(self, reason: str):
@@ -63,34 +56,28 @@ def immediate(store: Any) -> Iterator[None]:
 def _lease(conn: Any, table: str, task_id: str, owner: str | None,
            generation: int | None) -> None:
     if owner is None and generation is None:
-        return  # Unleased mode remains available only for explicit local/test callers.
+        return  # Unleased mode is for explicit trusted local/test callers.
     if not owner or type(generation) is not int or generation < 1:
         raise LeaseLost('invalid lease identity')
     if table not in {'task_leases', 'resource_leases'}:
         raise ValueError('unknown lease table')
-    row = conn.execute(
-        f'SELECT owner_id,generation,lease_until FROM {table} WHERE task_id=?',
-        (task_id,),
-    ).fetchone()
+    row = conn.execute(f'SELECT owner_id,generation,lease_until FROM {table} WHERE task_id=?',
+                       (task_id,)).fetchone()
     if (row is None or row['owner_id'] != owner or row['generation'] != generation
             or row['lease_until'] <= now()):
         raise LeaseLost(f'{table}: stale or expired lease')
 
 
 def validate_fences(store: Any, op: Any) -> None:
-    _lease(store.conn, 'task_leases', op.task_id,
-           op.task_lease_owner_id, op.task_lease_generation)
-    _lease(store.conn, 'resource_leases', op.task_id,
-           op.resource_lease_owner_id, op.resource_lease_generation)
+    _lease(store.conn, 'task_leases', op.task_id, op.task_lease_owner_id, op.task_lease_generation)
+    _lease(store.conn, 'resource_leases', op.task_id, op.resource_lease_owner_id, op.resource_lease_generation)
 
 
 def unsettled_rows(store: Any, task_id: str) -> list[Any]:
     states = tuple(s.value for s in UNSETTLED)
     marks = ','.join('?' for _ in states)
     return list(store.conn.execute(
-        f'SELECT * FROM operations WHERE task_id=? AND state IN ({marks})',
-        (task_id, *states),
-    ))
+        f'SELECT * FROM operations WHERE task_id=? AND state IN ({marks})', (task_id, *states)))
 
 
 def _task_allowed(row: Any) -> None:
@@ -120,8 +107,7 @@ def _world_preflight(store: Any, op: Any) -> tuple[str, ...]:
     locators = []
     for ref in op.object_refs:
         row = conn.execute('SELECT * FROM world_entities WHERE entity_id=?', (ref,)).fetchone()
-        if (row is None or row['status'] != 'active'
-                or row['workspace_id'] != op.workspace_id
+        if (row is None or row['status'] != 'active' or row['workspace_id'] != op.workspace_id
                 or op.required_permission not in json.loads(row['permissions_json'])):
             raise PermissionError(f'object access denied: {ref}')
         locators.append(row['locator'])
@@ -145,12 +131,16 @@ def _same_request(row: Any, op: Any) -> None:
 
 def _event(store: Any, op: Any, name: str, actor: str, payload: dict | None = None) -> None:
     store._insert_outbox(event_type=name, actor=actor, workspace_id=op.workspace_id,
-                        task_id=op.task_id, operation_id=op.operation_id,
-                        object_refs=op.object_refs, payload=payload or {})
+        task_id=op.task_id, operation_id=op.operation_id, object_refs=op.object_refs, payload=payload or {})
 
 
-def reserve_operation(store: Any, task: Any, op: Any) -> None:
-    """Budget decision, reservation, operation and outbox are one transaction."""
+def reserve_operation(store: Any, task: Any, op: Any, *, authorizer: Any = None,
+                      approval_id: str | None = None) -> None:
+    """Budget, operation, approval consumption and outbox commit atomically."""
+    if approval_id is not None and authorizer is None:
+        raise StateConflict('approval requires its authorization service')
+    if authorizer is not None and authorizer.store is not store:
+        raise StateConflict('authorization must share the operation store')
     with immediate(store):
         row = store.conn.execute('SELECT * FROM tasks WHERE task_id=?', (task.task_id,)).fetchone()
         _task_allowed(row)
@@ -165,25 +155,24 @@ def reserve_operation(store: Any, task: Any, op: Any) -> None:
         validate_fences(store, op)
         _world_preflight(store, op)
         budget.operations_started += 1
-        store.conn.execute(
-            'UPDATE tasks SET budget_json=?, revision=revision+1 WHERE task_id=?',
+        store.conn.execute('UPDATE tasks SET budget_json=?, revision=revision+1 WHERE task_id=?',
             (json.dumps({'max_operations': budget.max_operations,
                          'operations_started': budget.operations_started,
-                         'deadline_at': budget.deadline_at}), task.task_id),
-        )
+                         'deadline_at': budget.deadline_at}), task.task_id))
         store._upsert_operation(op)
+        if authorizer is not None:
+            authorizer.bind_in_transaction(op, approval_id)
         _event(store, op, 'operation.prepared', 'engine', {
             'budget_operations_started': budget.operations_started,
-            'budget_max_operations': budget.max_operations,
-        })
+            'budget_max_operations': budget.max_operations})
     copy_record(task, store.load_tasks()[task.task_id])
 
 
-def start_operation(store: Any, op: Any) -> tuple[str, ...]:
+def start_operation(store: Any, op: Any, *, authorizer: Any = None) -> tuple[str, ...]:
     """Only the winner of PREPARED -> RUNNING may invoke an adapter."""
+    from .approvals import check_dispatch_approval
     with immediate(store):
-        row = store.conn.execute('SELECT * FROM operations WHERE operation_id=?',
-                                 (op.operation_id,)).fetchone()
+        row = store.conn.execute('SELECT * FROM operations WHERE operation_id=?', (op.operation_id,)).fetchone()
         _same_request(row, op)
         if row['state'] != OperationState.PREPARED.value:
             raise OperationConflict(f'operation already dispatched or terminal: {row["state"]}')
@@ -194,9 +183,9 @@ def start_operation(store: Any, op: Any) -> tuple[str, ...]:
             raise BudgetExceeded('deadline')
         validate_fences(store, op)
         locators = _world_preflight(store, op)
+        check_dispatch_approval(store, op, authorizer)
         store.conn.execute('UPDATE operations SET state=? WHERE operation_id=? AND state=?',
-                           (OperationState.RUNNING.value, op.operation_id,
-                            OperationState.PREPARED.value))
+                           (OperationState.RUNNING.value, op.operation_id, OperationState.PREPARED.value))
         _event(store, op, 'operation.started', 'engine')
     op.state = OperationState.RUNNING
     return locators
@@ -206,8 +195,7 @@ def persist_operation(store: Any, op: Any, expected: OperationState,
                       event_type: str, actor: str, payload: dict | None = None) -> None:
     """CAS prevents a late callback from overwriting a newer recovery result."""
     with immediate(store):
-        row = store.conn.execute('SELECT * FROM operations WHERE operation_id=?',
-                                 (op.operation_id,)).fetchone()
+        row = store.conn.execute('SELECT * FROM operations WHERE operation_id=?', (op.operation_id,)).fetchone()
         _same_request(row, op)
         if row['state'] != expected.value:
             raise OperationConflict(f'operation changed: expected {expected.value}, got {row["state"]}')
@@ -218,8 +206,7 @@ def persist_operation(store: Any, op: Any, expected: OperationState,
 def persist_task(store: Any, task: Any, event_type: str, actor: str,
                  payload: dict | None = None) -> None:
     with immediate(store):
-        row = store.conn.execute('SELECT revision FROM tasks WHERE task_id=?',
-                                 (task.task_id,)).fetchone()
+        row = store.conn.execute('SELECT revision FROM tasks WHERE task_id=?', (task.task_id,)).fetchone()
         if row is not None and row['revision'] != task.revision - 1:
             raise StateConflict('stale task revision cannot overwrite newer task state')
         store._upsert_task(task)

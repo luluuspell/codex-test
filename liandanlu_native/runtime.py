@@ -116,6 +116,7 @@ class OperationRuntime:
     operations: dict[str, Operation] = field(default_factory=dict)
     persistence: Any = None
     _lock: Any = field(default_factory=RLock, repr=False)
+    approval_service: Any = None
 
     def __post_init__(self) -> None:
         if self.persistence is not None and (self.events.persistence is not self.persistence
@@ -142,7 +143,10 @@ class OperationRuntime:
             raise
 
     def prepare(self, task: Task, proposal: ActionProposal, *, expected_revisions: dict[str, int],
-                task_lease: TaskLease | None = None, resource_lease: ResourceLease | None = None) -> Operation:
+                task_lease: TaskLease | None = None, resource_lease: ResourceLease | None = None,
+                approval_id: str | None = None) -> Operation:
+        if approval_id is not None and (self.persistence is None or self.approval_service is None):
+            raise StateConflict('approved operation requires durable authorization service')
         spec = self.registry.resolve(proposal)
         self.world.assert_revisions(expected_revisions, workspace_id=task.workspace_id)
         for ref in proposal.object_refs:
@@ -168,7 +172,8 @@ class OperationRuntime:
             resource_lease_owner_id=resource_lease.owner_id if resource_lease else None,
             resource_lease_generation=resource_lease.generation if resource_lease else None)
         if self.persistence is not None:
-            reserve_operation(self.persistence, task, op)
+            reserve_operation(self.persistence, task, op, authorizer=self.approval_service,
+                              approval_id=approval_id)
         else:
             if task.state in TERMINAL_TASKS or task.desired_state in {TaskState.PAUSED, TaskState.CANCELLED}:
                 raise StateConflict('task is not allowed to dispatch')
@@ -210,7 +215,7 @@ class OperationRuntime:
         if capability is None:
             raise OperationConflict(f'capability unavailable: {op.capability}')
         if self.persistence is not None:
-            locators = start_operation(self.persistence, op)
+            locators = start_operation(self.persistence, op, authorizer=self.approval_service)
         else:
             with self._lock:
                 if op.state is not OperationState.PREPARED:
@@ -240,7 +245,7 @@ class OperationRuntime:
             if (self.persistence is not None and op.task_lease_owner_id is not None
                     and self.persistence.validate_task_lease_identity(op.task_id,
                         op.task_lease_owner_id, op.task_lease_generation)):
-                return op  # A live owner may still be about to dispatch.
+                return op
             self._transition(op, OperationState.CANCELLED, 'operation.abandoned_prepared', 'recovery')
             return op
         if op.state not in UNSETTLED:
@@ -249,7 +254,7 @@ class OperationRuntime:
                 and op.task_lease_owner_id is not None
                 and self.persistence.validate_task_lease_identity(op.task_id,
                     op.task_lease_owner_id, op.task_lease_generation)):
-            return op  # Do not race a live worker.
+            return op
         capability = self.capabilities.get(op.capability)
         if capability is None:
             op.error = f'capability unavailable: {op.capability}'
@@ -270,7 +275,6 @@ class OperationRuntime:
             return op
         op.result = result
         if not applied:
-            # False does NOT establish that the side effect did not happen.
             self._transition(op, OperationState.UNKNOWN, 'operation.reconcile_inconclusive', 'recovery')
             return op
         self._transition(op, OperationState.OBSERVED, 'operation.reconciled', 'recovery', {'applied': True})
