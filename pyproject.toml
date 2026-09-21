@@ -4,12 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "liandanlu-native-core"
-version = "0.5.0a8"
+version = "0.5.0a9"
 requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-cov>=5"]
+
+[tool.setuptools.packages.find]
+include = ["liandanlu_native*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
