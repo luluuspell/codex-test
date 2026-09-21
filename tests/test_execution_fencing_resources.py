@@ -274,9 +274,19 @@ def test_agent_records_fences_and_releases_resource_after_success():
         assert op.task_lease_owner_id == lease.owner_id
         assert op.task_lease_generation == lease.generation
         assert op.resource_lease_generation == 1
-        assert store.conn.execute(
-            "SELECT COUNT(*) AS n FROM resource_leases"
-        ).fetchone()["n"] == 0
+        row = store.conn.execute(
+            "SELECT * FROM resource_leases WHERE task_id=?",
+            (task.task_id,),
+        ).fetchone()
+        assert row is not None
+        assert row["generation"] == op.resource_lease_generation
+        assert row["lease_until"] == 0
+        assert not store.validate_resource_lease_identity(
+            task.task_id,
+            row["owner_id"],
+            row["generation"],
+            now_ts=now(),
+        )
         store.close()
 
 
