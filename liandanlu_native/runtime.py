@@ -168,7 +168,13 @@ class TaskScheduler:
             return False
         if current.owner_id != lease.owner_id or current.generation != lease.generation:
             return False
-        del self._leases[lease.task_id]
+        self._leases[lease.task_id] = TaskLease(
+            task_id=current.task_id,
+            owner_id=current.owner_id,
+            generation=current.generation,
+            claimed_at=current.claimed_at,
+            lease_until=0.0,
+        )
         return True
 
 

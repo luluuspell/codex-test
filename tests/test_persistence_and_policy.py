@@ -141,7 +141,7 @@ def test_policy_uses_authoritative_action_risk_before_operation_creation():
         read_task = tasks.create("read", ("done",), workspace_id="ws")
         read_task.desired_state = TaskState.RUNNING
         NativeAgentRunner(
-            tasks, ops, Model("read"), policy
+            tasks, ops, Model("read"), policy, require_task_lease=False
         ).step(read_task, build_manifest(read_task, world, refs))
         assert len(ops.operations) == 1
 
@@ -149,7 +149,8 @@ def test_policy_uses_authoritative_action_risk_before_operation_creation():
         write_task.desired_state = TaskState.RUNNING
         before = len(ops.operations)
         NativeAgentRunner(
-            tasks, ops, Model("write", {"content": "x"}), policy
+            tasks, ops, Model("write", {"content": "x"}), policy,
+            require_task_lease=False,
         ).step(write_task, build_manifest(write_task, world, refs))
         assert write_task.state is TaskState.WAITING
         assert len(ops.operations) == before

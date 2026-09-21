@@ -23,7 +23,7 @@ class NativeAgentRunner:
     model: CognitiveModel
     policy: PolicyEngine
     resources: ResourceBroker | None = None
-    require_task_lease: bool = False
+    require_task_lease: bool | None = None
     resource_lease_seconds: float = 60.0
 
     def step(
@@ -37,7 +37,12 @@ class NativeAgentRunner:
             raise ValueError("ContextManifest workspace does not match Task")
         if task_lease is not None and task_lease.task_id != task.task_id:
             raise LeaseLost("task lease belongs to another task")
-        if self.require_task_lease and task_lease is None:
+        lease_required = (
+            self.tasks.persistence is not None
+            if self.require_task_lease is None
+            else self.require_task_lease
+        )
+        if lease_required and task_lease is None:
             self.tasks.wait(
                 task.task_id,
                 "lease:required",

@@ -78,6 +78,9 @@ class ResourceBroker:
             )
 
         ts = now() if now_ts is None else now_ts
+        previous = self._leases.get(task_id)
+        if previous is not None and previous.lease_until > ts:
+            return None
         active = [lease for lease in self._active(ts) if lease.task_id != task_id]
         used_cpu = sum(lease.request.cpu_units for lease in active)
         used_memory = sum(lease.request.memory_mb for lease in active)
@@ -95,7 +98,6 @@ class ResourceBroker:
         ):
             return None
 
-        previous = self._leases.get(task_id)
         generation = 1 if previous is None else previous.generation + 1
         lease = ResourceLease(
             task_id=task_id,
@@ -150,7 +152,14 @@ class ResourceBroker:
             or current.generation != lease.generation
         ):
             return False
-        del self._leases[lease.task_id]
+        self._leases[lease.task_id] = ResourceLease(
+            task_id=current.task_id,
+            owner_id=current.owner_id,
+            generation=current.generation,
+            request=current.request,
+            claimed_at=current.claimed_at,
+            lease_until=0.0,
+        )
         return True
 
     def validate(

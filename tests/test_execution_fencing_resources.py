@@ -348,3 +348,73 @@ def test_memory_event_processing_is_serialized_across_connections():
         assert len(rows) == 1
         assert len(receipts) == 1
         verify.close()
+
+
+def test_persistent_agent_requires_task_lease_by_default():
+    with tempfile.TemporaryDirectory() as td:
+        store, world, events, tasks, ops, capability = build_core(
+            Path(td) / "native.db"
+        )
+        task = tasks.create("work", ("done",), workspace_id="ws")
+        task.desired_state = TaskState.RUNNING
+        refs = ReferentStack()
+        refs.push("file_A", "selection")
+        policy = PolicyEngine({
+            "ws": WorkspacePolicy(allowed_capabilities=frozenset({"heavy"}))
+        })
+        runner = NativeAgentRunner(tasks, ops, Model(), policy)
+        runner.step(task, build_manifest(task, world, refs))
+        assert task.state is TaskState.WAITING
+        assert task.wait_reason == "lease:required"
+        assert ops.operations == {}
+        assert capability.calls == 0
+        store.close()
+
+
+def test_released_task_lease_never_reuses_generation():
+    with tempfile.TemporaryDirectory() as td:
+        store, world, events, tasks, ops, capability = build_core(
+            Path(td) / "native.db"
+        )
+        scheduler = TaskScheduler(tasks)
+        task = tasks.create("work", ("done",), workspace_id="ws")
+        scheduler.submit(task.task_id)
+        base = now()
+        lease1 = scheduler.claim_next("runner", lease_seconds=30, now_ts=base)
+        assert lease1 is not None
+        assert scheduler.release(lease1)
+        lease2 = scheduler.claim_next("runner", lease_seconds=30, now_ts=base + 1)
+        assert lease2 is not None
+        assert lease2.generation == lease1.generation + 1
+        assert not store.validate_task_lease_identity(
+            lease1.task_id, lease1.owner_id, lease1.generation, now_ts=base + 1
+        )
+        store.close()
+
+
+def test_released_resource_lease_never_reuses_generation_or_allows_active_steal():
+    with tempfile.TemporaryDirectory() as td:
+        store = SQLiteStore(Path(td) / "native.db")
+        broker = ResourceBroker(
+            ResourceCapacity(cpu_units=100, memory_mb=1000, gpu_units=100),
+            persistence=store,
+        )
+        request = ResourceRequest(memory_mb=400)
+        base = now()
+        lease1 = broker.acquire(
+            "task-1", "runner-1", request, lease_seconds=30, now_ts=base
+        )
+        assert lease1 is not None
+        assert broker.acquire(
+            "task-1", "runner-2", request, lease_seconds=30, now_ts=base + 1
+        ) is None
+        assert broker.release(lease1)
+        lease2 = broker.acquire(
+            "task-1", "runner-2", request, lease_seconds=30, now_ts=base + 2
+        )
+        assert lease2 is not None
+        assert lease2.generation == lease1.generation + 1
+        assert not store.validate_resource_lease_identity(
+            lease1.task_id, lease1.owner_id, lease1.generation, now_ts=base + 2
+        )
+        store.close()

@@ -911,7 +911,8 @@ class SQLiteStore:
         with self.conn:
             cursor = self.conn.execute(
                 """
-                DELETE FROM task_leases
+                UPDATE task_leases
+                SET lease_until=0
                 WHERE task_id=? AND owner_id=? AND generation=?
                 """,
                 (lease.task_id, lease.owner_id, lease.generation),
@@ -1002,6 +1003,9 @@ class SQLiteStore:
                 "SELECT * FROM resource_leases WHERE task_id=?",
                 (task_id,),
             ).fetchone()
+            if existing is not None and existing["lease_until"] > ts:
+                self.conn.commit()
+                return None
             rows = list(self.conn.execute(
                 """
                 SELECT * FROM resource_leases
@@ -1100,7 +1104,8 @@ class SQLiteStore:
         with self.conn:
             cursor = self.conn.execute(
                 """
-                DELETE FROM resource_leases
+                UPDATE resource_leases
+                SET lease_until=0
                 WHERE task_id=? AND owner_id=? AND generation=?
                 """,
                 (lease.task_id, lease.owner_id, lease.generation),
